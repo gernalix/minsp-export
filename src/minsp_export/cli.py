@@ -6,6 +6,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from .archive import build_complete_archive, write_final_report
 from .browser import AuthRequired, BrowserSession
 from .config import DEFAULT_OUTPUT_DIR, DEFAULT_PROFILE_DIR, Settings
 from .crawler import Crawler
@@ -119,6 +120,11 @@ def cmd_export(args) -> int:
         print(db_path)
         markdown_path = render_markdown(db_path, settings.markdown_path)
         print(markdown_path)
+        final_report_path = write_final_report(store, db_path, result.run_id)
+        print(final_report_path)
+        if crawl_rc == 0:
+            archive_path = build_complete_archive(store)
+            print(archive_path)
         return crawl_rc
     except AuthRequired as exc:
         print(str(exc), file=sys.stderr)

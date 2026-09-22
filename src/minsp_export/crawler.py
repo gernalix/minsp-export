@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import re
 from dataclasses import dataclass
@@ -278,6 +279,75 @@ class Crawler:
                 target_url=target,
             )
 
+    def _crawl_readonly_tabs(self, page, run_id: str, depth: int, max_tabs: int = 100) -> int:
+        clicked = 0
+        seen: set[tuple[str, str]] = set()
+        for frame in list(page.frames):
+            try:
+                tabs = frame.locator("[role=tab]")
+                initial_count = min(tabs.count(), max_tabs - clicked)
+            except Exception:
+                continue
+            for index in range(initial_count):
+                label = f"index:{index}"
+                try:
+                    # Re-query after every click because Epic commonly
+                    # re-renders the entire tablist.
+                    locator = frame.locator("[role=tab]").nth(index)
+                    label = " ".join(
+                        (locator.get_attribute("aria-label") or locator.inner_text() or "").split()
+                    )
+                    identity = (frame.url, label)
+                    if not label or identity in seen:
+                        continue
+                    if not locator.is_visible() or not locator.is_enabled():
+                        continue
+                    seen.add(identity)
+                    locator.click(timeout=2500)
+                    page.wait_for_timeout(450)
+                    _settle_and_scroll(page, self.settings.settle_ms)
+                    _safe_reveal(page)
+                    _trigger_explicit_downloads(page)
+                    self._observe_page(page, run_id)
+
+                    digest = hashlib.sha256(f"{page.url}|{label}".encode()).hexdigest()[:16]
+                    parts = urlsplit(page.url)
+                    query = f"{parts.query}&" if parts.query else ""
+                    source_url = urlunsplit(
+                        (parts.scheme, parts.netloc, parts.path, f"{query}__minsp_view=tab-{digest}", "")
+                    )
+                    self.store.save_artifact(
+                        kind="html",
+                        data=frame.content().encode("utf-8"),
+                        source_url=source_url,
+                        content_type="text/html; charset=utf-8",
+                        extension=".html",
+                    )
+                    self.store.observe(
+                        run_id=run_id,
+                        page_url=page.url,
+                        kind="tab_snapshot",
+                        label=label,
+                        target_url=source_url,
+                    )
+                    if depth < self.settings.max_depth:
+                        for href in _extract_hrefs(page):
+                            absolute = canonical_url(urljoin(page.url, href))
+                            if eligible_url(absolute):
+                                self.store.enqueue(absolute, depth + 1, run_id)
+                    clicked += 1
+                    if clicked >= max_tabs:
+                        return clicked
+                except Exception:
+                    self.store.observe(
+                        run_id=run_id,
+                        page_url=page.url,
+                        kind="tab_error",
+                        label=label,
+                    )
+                    continue
+        return clicked
+
     def run(
         self,
         *,
@@ -374,6 +444,7 @@ class Crawler:
                 _trigger_explicit_downloads(page)
 
                 self._observe_page(page, run_id)
+                self._crawl_readonly_tabs(page, run_id, depth)
 
                 html = page.content().encode("utf-8")
                 path, digest = self.store.save_artifact(

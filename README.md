@@ -21,10 +21,20 @@ export/
 │   └── complete-medical-record.md
 ├── manifests/
 │   ├── files.jsonl
-│   └── coverage.json
+│   ├── coverage.json
+│   ├── inventory.json
+│   └── final-report.json
 ├── logs/
 └── state.sqlite
 ```
+
+A successful `export` also creates
+`~/Documents/MinSP/minsp-export-complete-2026-09-22.zip`. The archive contains
+only `raw/`, `manifests/`, a sanitized copy of `state.sqlite`,
+`normalized/health.sqlite`, and `text/complete-medical-record.md`. Browser
+profiles, cookies, session storage, credentials, and logs are excluded. The raw
+artifacts remain the authoritative immutable source; the normalized database is
+a technical projection and never replaces the raw capture.
 
 The normalized database contains a generic record layer plus dedicated tables for lab results, clinical notes, encounters, imaging reports, diagnoses, medications, allergies, appointments, messages, procedures, questionnaires, documents, providers and departments. An FTS5 index makes the captured text searchable.
 
@@ -69,7 +79,7 @@ minsp-export search ferritin
 
 `minsp-export export` is the normal workflow. If authentication is required it opens the dedicated Chrome profile, waits for manual MitID, verifies that Chrome has actually returned to an authenticated Min Sundhedsplatform URL, and continues crawling in that same browser context without closing/reopening Chrome. The separate `login` command is diagnostic only and should not be used as a pre-step for an export.
 
-During the first real crawl, `export` deliberately reopens the durable crawl state after the first captured page while keeping that same authenticated browser context alive. This proves checkpoint/resume without forcing another MitID login. The final export rebuilds a one-row-per-artifact SHA-256 manifest, verifies every artifact, and writes the observed pages, controls, responses and downloads to `manifests/coverage.json`.
+During the first real crawl, `export` deliberately reopens the durable crawl state after the first captured page while keeping that same authenticated browser context alive. This proves checkpoint/resume without forcing another MitID login. The final export rebuilds a one-row-per-artifact SHA-256 manifest, verifies every artifact, writes the observed pages, controls, responses and downloads to `manifests/coverage.json`, generates the final technical report, and packages the allowlisted local archive only when the crawl has no exhausted errors.
 
 For unattended/incremental runs use:
 

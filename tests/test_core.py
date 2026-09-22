@@ -4,15 +4,17 @@ import json
 import sqlite3
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from minsp_export import cli
+from minsp_export.archive import ARCHIVE_NAME, build_complete_archive, write_final_report
 from minsp_export.browser import BrowserSession
 from minsp_export.crawler import Crawler, CrawlResult, canonical_url, eligible_url, response_kind
 from minsp_export.normalize import Normalizer, classify_dict
-from minsp_export.render import search
+from minsp_export.render import render_markdown, search
 from minsp_export.storage import StateStore, redact_url
 
 
@@ -49,6 +51,9 @@ class UrlPolicyTests(unittest.TestCase):
 
     def test_destructive_route_rejected(self):
         self.assertFalse(eligible_url("https://minsundhedsplatform.dk/mychartppr1/app/cancelappointment/123"))
+
+    def test_portal_error_route_rejected(self):
+        self.assertFalse(eligible_url("https://minsundhedsplatform.dk/mychartppr1/Home/Error?code=x"))
 
     def test_fragment_removed(self):
         self.assertEqual(
@@ -213,15 +218,153 @@ class NormalizationTests(unittest.TestCase):
             conn.close()
             store.close()
 
+    def test_html_category_has_matching_domain_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = StateStore(root)
+            store.save_artifact(
+                kind="html",
+                data=b"<html><title>Results</title><body>Laboratory results</body></html>",
+                source_url="https://minsundhedsplatform.dk/mychartppr1/app/testresults",
+                content_type="text/html",
+                extension=".html",
+            )
+            db = Normalizer(store).build()
+            conn = sqlite3.connect(db)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM records WHERE category='lab_result'").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM lab_results").fetchone()[0], 1)
+            conn.close()
+            store.close()
+
+
+class ReadOnlyTabTests(unittest.TestCase):
+    @patch("minsp_export.crawler._extract_hrefs", return_value=[])
+    @patch("minsp_export.crawler._trigger_explicit_downloads", return_value=0)
+    @patch("minsp_export.crawler._safe_reveal", return_value=0)
+    @patch("minsp_export.crawler._settle_and_scroll")
+    def test_role_tab_is_clicked_and_snapshotted(
+        self, _settle, _reveal, _downloads, _hrefs
+    ):
+        store = MagicMock()
+        settings = SimpleNamespace(settle_ms=0, max_depth=24)
+        crawler = Crawler(settings, store)
+        tab = MagicMock()
+        tab.get_attribute.return_value = "Appointments"
+        tab.inner_text.return_value = "Appointments"
+        tab.is_visible.return_value = True
+        tab.is_enabled.return_value = True
+        tabs = MagicMock()
+        tabs.count.return_value = 1
+        tabs.nth.return_value = tab
+        frame = MagicMock()
+        frame.url = "https://minsundhedsplatform.dk/mychartppr1/app/home"
+        frame.locator.return_value = tabs
+        frame.content.return_value = "<html>Appointments</html>"
+        page = MagicMock()
+        page.frames = [frame]
+        page.url = frame.url
+        page.content.return_value = "<html>Appointments</html>"
+
+        self.assertEqual(crawler._crawl_readonly_tabs(page, "run", 0), 1)
+        tab.click.assert_called_once()
+        store.save_artifact.assert_called_once()
+        self.assertEqual(store.observe.call_args.kwargs["kind"], "tab_snapshot")
+
+
+class ArchiveTests(unittest.TestCase):
+    def test_complete_archive_is_allowlisted_and_state_copy_is_sanitized(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / "export"
+            store = StateStore(root)
+            run_id, _ = store.begin_run()
+            source_url = (
+                "https://minsundhedsplatform.dk/mychartppr1/app/results"
+                "?token=abc"
+            )
+            store.enqueue(source_url, 0, run_id)
+            path, digest = store.save_artifact(
+                kind="html",
+                data=b"<html><title>Results</title><body>Laboratory results</body></html>",
+                source_url=source_url,
+                content_type="text/html",
+                extension=".html",
+            )
+            store.mark_page_done(
+                source_url,
+                title="Results",
+                local_path=str(path.relative_to(root)),
+                digest=digest,
+            )
+            store.finish_run(run_id)
+            store.observe(
+                run_id=run_id,
+                page_url="https://minsundhedsplatform.dk/mychartppr1/app/results",
+                kind="control:tab",
+                label="Laboratory",
+            )
+            store.observe(
+                run_id=run_id,
+                page_url="https://minsundhedsplatform.dk/mychartppr1/app/results",
+                kind="tab_snapshot",
+                label="Laboratory",
+            )
+            store.write_coverage_report(run_id)
+            self.assertEqual(store.verify_artifacts()["errors"], [])
+            db_path = Normalizer(store).build()
+            render_markdown(db_path, root / "text" / "complete-medical-record.md")
+            write_final_report(store, db_path, run_id)
+
+            archive = build_complete_archive(store)
+            self.assertEqual(archive, base / ARCHIVE_NAME)
+            with zipfile.ZipFile(archive) as zf:
+                names = set(zf.namelist())
+                self.assertIn("state.sqlite", names)
+                self.assertIn("normalized/health.sqlite", names)
+                self.assertIn("text/complete-medical-record.md", names)
+                self.assertIn("manifests/inventory.json", names)
+                self.assertIn("manifests/final-report.json", names)
+                self.assertTrue(any(name.startswith("raw/html/") for name in names))
+                self.assertFalse(any(name.startswith("logs/") for name in names))
+                extracted = Path(zf.extract("state.sqlite", base / "extracted"))
+
+            archived = sqlite3.connect(extracted)
+            archived_url = archived.execute("SELECT url FROM pages").fetchone()[0]
+            archived.close()
+            self.assertNotIn("token=abc", archived_url)
+            live_url = store.conn.execute("SELECT url FROM pages").fetchone()[0]
+            self.assertIn("token=abc", live_url)
+            store.close()
+
+    def test_final_report_rejects_an_unsnapshotted_read_only_tab(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            store = StateStore(root)
+            run_id, _ = store.begin_run()
+            store.observe(
+                run_id=run_id,
+                page_url="https://minsundhedsplatform.dk/mychartppr1/app/home",
+                kind="control:tab",
+                label="Appointments",
+            )
+            store.finish_run(run_id)
+            db_path = Normalizer(store).build()
+            with self.assertRaisesRegex(RuntimeError, "read_only_tab_coverage_incomplete"):
+                write_final_report(store, db_path, run_id)
+            store.close()
+
 
 class ExportWorkflowTests(unittest.TestCase):
+    @patch("minsp_export.cli.build_complete_archive")
+    @patch("minsp_export.cli.write_final_report")
     @patch("minsp_export.cli.render_markdown")
     @patch("minsp_export.cli.Normalizer")
     @patch("minsp_export.cli.Crawler")
     @patch("minsp_export.cli.BrowserSession")
     @patch("minsp_export.cli.StateStore")
     def test_export_reopens_checkpoint_without_reopening_browser(
-        self, state_store, browser_session, crawler_cls, normalizer, render_markdown
+        self, state_store, browser_session, crawler_cls, normalizer, render_markdown,
+        write_final_report, build_complete_archive
     ):
         first_store = MagicMock()
         second_store = MagicMock()
@@ -245,6 +388,8 @@ class ExportWorkflowTests(unittest.TestCase):
         }
         normalizer.return_value.build.return_value = Path("health.sqlite")
         render_markdown.return_value = Path("complete-medical-record.md")
+        write_final_report.return_value = Path("final-report.json")
+        build_complete_archive.return_value = Path(ARCHIVE_NAME)
         args = SimpleNamespace(
             output="/tmp/export",
             profile="/tmp/profile",
@@ -258,6 +403,8 @@ class ExportWorkflowTests(unittest.TestCase):
         first_store.close.assert_called_once()
         self.assertIs(first_crawler.run.call_args.kwargs["browser"], browser)
         self.assertIs(second_crawler.run.call_args.kwargs["browser"], browser)
+        write_final_report.assert_called_once_with(second_store, Path("health.sqlite"), "run")
+        build_complete_archive.assert_called_once_with(second_store)
 
 
 if __name__ == "__main__":

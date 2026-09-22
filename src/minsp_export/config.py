@@ -26,6 +26,7 @@ BLOCKED_URL_TOKENS = (
     "schedulevisit",
     "refillrequest",
     "proxyaccess/request",
+    "home/error",
 )
 
 SAFE_REVEAL_LABELS = (
