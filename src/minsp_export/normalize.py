@@ -133,8 +133,11 @@ def classify_dict(obj: dict[str, Any], source_url: str = "") -> str | None:
     if has("note", "journal", "notat") and has("author", "body", "text", "date"):
         return "clinical_note"
 
+    direct_scalar_count = sum(
+        _scalar(value) not in (None, "") for value in obj.values()
+    )
     for category, hints in CATEGORY_HINTS.items():
-        if any(h in source_url.lower() for h in hints) and len(_all_scalar_text(obj)) >= 3:
+        if any(h in source_url.lower() for h in hints) and direct_scalar_count >= 3:
             return category
     return None
 

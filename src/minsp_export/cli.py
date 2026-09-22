@@ -30,10 +30,6 @@ def cmd_login(args) -> int:
     with BrowserSession(settings, headless=False) as browser:
         url = browser.ensure_authenticated(interactive=True)
         print(f"AUTHENTICATED: {url}")
-        try:
-            input("Press Enter to close the dedicated browser profile. ")
-        except EOFError:
-            pass
     return 0
 
 
