@@ -210,7 +210,12 @@ def build_complete_archive(store: StateStore) -> Path:
     if missing:
         raise FileNotFoundError("archive inputs missing: " + ", ".join(missing))
 
-    with tempfile.TemporaryDirectory(prefix="minsp-export-archive-") as tmp_dir:
+    # Keep the temporary ZIP on the destination filesystem so the final
+    # atomic os.replace cannot fail with EXDEV on hosts where /tmp is separate.
+    with tempfile.TemporaryDirectory(
+        prefix=".minsp-export-archive-",
+        dir=root.parent,
+    ) as tmp_dir:
         tmp_root = Path(tmp_dir)
         sanitized_state = tmp_root / "state.sqlite"
         _sanitized_state_copy(store, sanitized_state)
