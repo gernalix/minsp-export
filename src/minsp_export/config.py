@@ -33,6 +33,9 @@ SAFE_REVEAL_LABELS = (
     "se mere",
     "show more",
     "load more",
+    "næste",
+    "naeste",
+    "next",
 )
 
 

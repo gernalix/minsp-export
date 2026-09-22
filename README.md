@@ -20,7 +20,8 @@ export/
 ├── text/
 │   └── complete-medical-record.md
 ├── manifests/
-│   └── files.jsonl
+│   ├── files.jsonl
+│   └── coverage.json
 ├── logs/
 └── state.sqlite
 ```
@@ -67,6 +68,8 @@ minsp-export search ferritin
 ```
 
 `minsp-export export` is the normal workflow. If authentication is required it opens the dedicated Chrome profile, waits for manual MitID, verifies that Chrome has actually returned to an authenticated Min Sundhedsplatform URL, and continues crawling in that same browser context without closing/reopening Chrome. The separate `login` command is diagnostic only and should not be used as a pre-step for an export.
+
+During the first real crawl, `export` deliberately reopens the durable crawl state after the first captured page while keeping that same authenticated browser context alive. This proves checkpoint/resume without forcing another MitID login. The final export rebuilds a one-row-per-artifact SHA-256 manifest, verifies every artifact, and writes the observed pages, controls, responses and downloads to `manifests/coverage.json`.
 
 For unattended/incremental runs use:
 
