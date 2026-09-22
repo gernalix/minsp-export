@@ -102,6 +102,8 @@ CATEGORY_HINTS = {
     "questionnaire": ("questionnaire", "spørgeskema", "sporgeskema"),
 }
 
+DOMAIN_CATEGORIES = frozenset(CATEGORY_HINTS)
+
 
 def classify_dict(obj: dict[str, Any], source_url: str = "") -> str | None:
     keys = {_norm_key(str(k)) for k in obj}
@@ -292,8 +294,8 @@ class Normalizer:
             "INSERT INTO search_index(record_id,category,title,body) VALUES(?,?,?,?)",
             (record_id, category, title or category, body),
         )
-        if obj is not None:
-            self._insert_specific(conn, record_id, category, obj, body)
+        if obj is not None or category in DOMAIN_CATEGORIES:
+            self._insert_specific(conn, record_id, category, obj or {}, body)
 
     def _normalize_html(self, conn, artifact, path: Path) -> None:
         parser = VisibleTextParser()

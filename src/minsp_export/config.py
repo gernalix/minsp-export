@@ -26,6 +26,7 @@ BLOCKED_URL_TOKENS = (
     "schedulevisit",
     "refillrequest",
     "proxyaccess/request",
+    "home/error",
 )
 
 SAFE_REVEAL_LABELS = (
@@ -33,6 +34,9 @@ SAFE_REVEAL_LABELS = (
     "se mere",
     "show more",
     "load more",
+    "næste",
+    "naeste",
+    "next",
 )
 
 

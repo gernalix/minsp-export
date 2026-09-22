@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import mimetypes
 import re
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ class CrawlResult:
     pending: int
     exhausted_errors: int
     resumed: bool
+    checkpoint_interrupted: bool = False
+    checkpoint_resumed: bool = False
 
 
 def canonical_url(url: str) -> str:
@@ -51,6 +54,8 @@ def response_kind(url: str, content_type: str, content_disposition: str) -> tupl
         return "json", ".json"
     if "application/pdf" in ct or low_url.endswith(".pdf"):
         return "pdf", ".pdf"
+    if ct in ("text/html", "application/xhtml+xml"):
+        return "html", ".html"
 
     attachment_like = "attachment" in cd or any(
         token in low_url for token in ("/attachment", "/document", "/download", "/file/")
@@ -65,11 +70,44 @@ def response_kind(url: str, content_type: str, content_disposition: str) -> tupl
 
 
 def _extract_hrefs(page) -> list[str]:
-    try:
-        values = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href).filter(Boolean)")
-        return [str(v) for v in values]
-    except Exception:
-        return []
+    out: list[str] = []
+    for frame in page.frames:
+        try:
+            values = frame.eval_on_selector_all(
+                "a[href],[data-href],[data-url],[data-route]",
+                """els => els.map(e => e.href || e.dataset.href || e.dataset.url || e.dataset.route)
+                         .filter(Boolean)""",
+            )
+            out.extend(str(v) for v in values)
+        except Exception:
+            continue
+    return list(dict.fromkeys(out))
+
+
+def _extract_controls(page) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for frame in page.frames:
+        try:
+            rows = frame.eval_on_selector_all(
+                "a,button,[role=button],[role=tab]",
+                """els => els.map(e => ({
+                    kind: e.getAttribute('role') || e.tagName.toLowerCase(),
+                    label: (e.getAttribute('aria-label') || e.innerText || e.textContent || '').trim(),
+                    target: e.href || e.dataset?.href || e.dataset?.url || e.dataset?.route || ''
+                })).filter(x => x.label || x.target)""",
+            )
+            for row in rows:
+                out.append({
+                    "kind": str(row.get("kind") or "control"),
+                    "label": " ".join(str(row.get("label") or "").split())[:500],
+                    "target": str(row.get("target") or ""),
+                })
+        except Exception:
+            continue
+    unique: dict[tuple[str, str, str], dict[str, str]] = {}
+    for row in out:
+        unique[(row["kind"], row["label"], row["target"])] = row
+    return list(unique.values())
 
 
 def _safe_reveal(page, max_clicks: int = 20) -> int:
@@ -97,6 +135,44 @@ def _settle_and_scroll(page, settle_ms: int) -> None:
         page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
         pass
+
+
+def _trigger_explicit_downloads(page, max_clicks: int = 100) -> int:
+    selectors = (
+        "a[download]",
+        "button",
+        "[role=button]",
+    )
+    labels = re.compile(r"^\s*(?:download(?: pdf)?|hent(?: dokument| fil| pdf)?)\s*$", re.I)
+    clicked = 0
+    seen: set[tuple[str, str]] = set()
+    for selector in selectors:
+        try:
+            locators = page.locator(selector)
+            count = min(locators.count(), max_clicks)
+        except Exception:
+            continue
+        for index in range(count):
+            locator = locators.nth(index)
+            try:
+                label = " ".join((locator.get_attribute("aria-label") or locator.inner_text() or "").split())
+                href = locator.get_attribute("href") or ""
+                identity = (label, href)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                if selector != "a[download]" and not labels.match(label):
+                    continue
+                if not locator.is_visible() or not locator.is_enabled():
+                    continue
+                with page.expect_download(timeout=2500):
+                    locator.click(timeout=2000)
+                clicked += 1
+                if clicked >= max_clicks:
+                    return clicked
+            except Exception:
+                continue
+    return clicked
     stable = 0
     last = -1
     for _ in range(8):
@@ -123,11 +199,21 @@ class Crawler:
     def __init__(self, settings: Settings, store: StateStore):
         self.settings = settings
         self.store = store
+        self._run_id = ""
 
     def _capture_response(self, response) -> None:
         try:
             if response.status < 200 or response.status >= 400:
                 return
+            if not eligible_url(response.url):
+                return
+            if self._run_id:
+                self.store.observe(
+                    run_id=self._run_id,
+                    page_url=response.frame.url if response.frame else response.url,
+                    kind="response",
+                    target_url=response.url,
+                )
             headers = response.headers
             content_type = headers.get("content-type", "")
             content_disposition = headers.get("content-disposition", "")
@@ -148,12 +234,162 @@ class Crawler:
         except Exception:
             return
 
+    def _capture_download(self, download) -> None:
+        try:
+            # A portal-generated attachment may be served by a separate CDN.
+            # Trust the initiating authenticated portal page, never an auth or
+            # external page by itself.
+            if not eligible_url(download.page.url):
+                return
+            path = download.path()
+            if path is None:
+                return
+            filename = download.suggested_filename or Path(urlsplit(download.url).path).name
+            extension = Path(filename).suffix[:12] or ".bin"
+            data = Path(path).read_bytes()
+            kind = "pdf" if extension.lower() == ".pdf" else "attachments"
+            self.store.save_artifact(
+                kind=kind,
+                data=data,
+                source_url=download.url,
+                content_type="application/pdf" if kind == "pdf" else "application/octet-stream",
+                extension=extension,
+            )
+            if self._run_id:
+                self.store.observe(
+                    run_id=self._run_id,
+                    page_url=download.page.url,
+                    kind="download",
+                    label=filename,
+                    target_url=download.url,
+                )
+        except Exception:
+            return
+
+    def _observe_page(self, page, run_id: str) -> None:
+        for row in _extract_controls(page):
+            target = row["target"]
+            if target:
+                target = canonical_url(urljoin(page.url, target))
+            self.store.observe(
+                run_id=run_id,
+                page_url=page.url,
+                kind=f"control:{row['kind']}",
+                label=row["label"],
+                target_url=target,
+            )
+
+    def _crawl_readonly_tabs(self, page, run_id: str, depth: int, max_tabs: int = 100) -> int:
+        clicked = 0
+        seen: set[tuple[str, str]] = set()
+        for frame in list(page.frames):
+            try:
+                tabs = frame.locator("[role=tab]")
+                initial_count = min(tabs.count(), max_tabs - clicked)
+                labels = []
+                for index in range(initial_count):
+                    locator = tabs.nth(index)
+                    label = " ".join(
+                        (locator.get_attribute("aria-label") or locator.inner_text() or "").split()
+                    )
+                    if label and label not in labels:
+                        labels.append(label)
+            except Exception:
+                continue
+            for label in labels:
+                try:
+                    identity = (frame.url, label)
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
+
+                    # Resolve by label after every click. Epic re-renders the
+                    # whole tablist, so retaining an index can silently point
+                    # at a different or temporarily empty element.
+                    locator = None
+                    for _ in range(3):
+                        current = frame.locator("[role=tab]")
+                        for index in range(min(current.count(), max_tabs)):
+                            candidate = current.nth(index)
+                            candidate_label = " ".join(
+                                (
+                                    candidate.get_attribute("aria-label")
+                                    or candidate.inner_text()
+                                    or ""
+                                ).split()
+                            )
+                            if candidate_label == label:
+                                try:
+                                    candidate.scroll_into_view_if_needed(timeout=1200)
+                                except Exception:
+                                    pass
+                                if candidate.is_visible() and candidate.is_enabled():
+                                    locator = candidate
+                                break
+                        if locator is not None:
+                            break
+                        page.wait_for_timeout(250)
+                    if locator is None:
+                        self.store.observe(
+                            run_id=run_id,
+                            page_url=page.url,
+                            kind="tab_unavailable",
+                            label=label,
+                        )
+                        continue
+
+                    locator.click(timeout=2500)
+                    page.wait_for_timeout(450)
+                    _settle_and_scroll(page, self.settings.settle_ms)
+                    _safe_reveal(page)
+                    _trigger_explicit_downloads(page)
+                    self._observe_page(page, run_id)
+
+                    digest = hashlib.sha256(f"{page.url}|{label}".encode()).hexdigest()[:16]
+                    parts = urlsplit(page.url)
+                    query = f"{parts.query}&" if parts.query else ""
+                    source_url = urlunsplit(
+                        (parts.scheme, parts.netloc, parts.path, f"{query}__minsp_view=tab-{digest}", "")
+                    )
+                    self.store.save_artifact(
+                        kind="html",
+                        data=frame.content().encode("utf-8"),
+                        source_url=source_url,
+                        content_type="text/html; charset=utf-8",
+                        extension=".html",
+                    )
+                    self.store.observe(
+                        run_id=run_id,
+                        page_url=page.url,
+                        kind="tab_snapshot",
+                        label=label,
+                        target_url=source_url,
+                    )
+                    if depth < self.settings.max_depth:
+                        for href in _extract_hrefs(page):
+                            absolute = canonical_url(urljoin(page.url, href))
+                            if eligible_url(absolute):
+                                self.store.enqueue(absolute, depth + 1, run_id)
+                    clicked += 1
+                    if clicked >= max_tabs:
+                        return clicked
+                except Exception:
+                    self.store.observe(
+                        run_id=run_id,
+                        page_url=page.url,
+                        kind="tab_error",
+                        label=label,
+                    )
+                    continue
+        return clicked
+
     def run(
         self,
         *,
         interactive: bool = True,
         expand_safe: bool = True,
         browser: BrowserSession | None = None,
+        checkpoint_probe: bool = False,
     ) -> CrawlResult:
         run_id, resumed = self.store.begin_run()
 
@@ -164,6 +400,7 @@ class Crawler:
                 resumed=resumed,
                 interactive=interactive,
                 expand_safe=expand_safe,
+                checkpoint_probe=checkpoint_probe,
             )
 
         with BrowserSession(self.settings, headless=not interactive) as owned_browser:
@@ -173,6 +410,7 @@ class Crawler:
                 resumed=resumed,
                 interactive=interactive,
                 expand_safe=expand_safe,
+                checkpoint_probe=checkpoint_probe,
             )
 
     def _run_with_browser(
@@ -183,17 +421,35 @@ class Crawler:
         resumed: bool,
         interactive: bool,
         expand_safe: bool,
+        checkpoint_probe: bool,
     ) -> CrawlResult:
         visited = 0
+        checkpoint_resumed = False
         page = browser.page
         assert page is not None
-        page.on("response", self._capture_response)
+        self._run_id = run_id
+        context = browser.context
+        assert context is not None
+        context.on("response", self._capture_response)
+        context.on("page", lambda new_page: new_page.on("download", self._capture_download))
+        for open_page in context.pages:
+            open_page.on("download", self._capture_download)
+
+        if self.store.get_meta("checkpoint_probe_pending") == run_id:
+            checkpoint_resumed = True
+            self.store.set_meta("checkpoint_probe_pending", None)
+            self.store.set_meta(
+                "checkpoint_probe_completed",
+                f"run_id={run_id};resumed_at={self.store.get_meta('active_run_id')}",
+            )
 
         # Authentication and the crawl intentionally share the exact same
         # BrowserSession. Do not close/reopen Chrome between MitID and crawling.
         start_url = canonical_url(browser.ensure_authenticated(interactive=interactive))
         if eligible_url(start_url):
             self.store.enqueue(start_url, 0, run_id)
+
+        self._observe_page(page, run_id)
 
         for href in _extract_hrefs(page):
             absolute = canonical_url(urljoin(page.url, href))
@@ -220,6 +476,11 @@ class Crawler:
                 if expand_safe and _safe_reveal(page):
                     _settle_and_scroll(page, self.settings.settle_ms)
 
+                _trigger_explicit_downloads(page)
+
+                self._observe_page(page, run_id)
+                self._crawl_readonly_tabs(page, run_id, depth)
+
                 html = page.content().encode("utf-8")
                 path, digest = self.store.save_artifact(
                     kind="html",
@@ -242,10 +503,35 @@ class Crawler:
                         if eligible_url(absolute):
                             self.store.enqueue(absolute, depth + 1, run_id)
                 visited += 1
+                if (
+                    checkpoint_probe
+                    and not checkpoint_resumed
+                    and not self.store.get_meta("checkpoint_probe_completed")
+                ):
+                    self.store.set_meta("checkpoint_probe_pending", run_id)
+                    return CrawlResult(
+                        run_id=run_id,
+                        pages_visited=visited,
+                        pending=self.store.pending_count(run_id, self.settings.max_retries),
+                        exhausted_errors=self.store.exhausted_error_count(run_id, self.settings.max_retries),
+                        resumed=resumed,
+                        checkpoint_interrupted=True,
+                        checkpoint_resumed=False,
+                    )
             except AuthRequired:
                 raise
             except Exception as exc:
-                self.store.mark_page_error(url, f"{type(exc).__name__}: {exc}")
+                downloaded = self.store.artifact_for_source(url)
+                if downloaded is not None:
+                    self.store.mark_page_done(
+                        url,
+                        title="Downloaded attachment",
+                        local_path=downloaded["local_path"],
+                        digest=downloaded["sha256"],
+                    )
+                    visited += 1
+                else:
+                    self.store.mark_page_error(url, f"{type(exc).__name__}: {exc}")
 
         pending = self.store.pending_count(run_id, self.settings.max_retries)
         exhausted = self.store.exhausted_error_count(run_id, self.settings.max_retries)
@@ -257,4 +543,6 @@ class Crawler:
             pending=pending,
             exhausted_errors=exhausted,
             resumed=resumed,
+            checkpoint_interrupted=False,
+            checkpoint_resumed=checkpoint_resumed,
         )

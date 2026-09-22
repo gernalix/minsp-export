@@ -6,6 +6,7 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
+from .archive import build_complete_archive, write_final_report
 from .browser import AuthRequired, BrowserSession
 from .config import DEFAULT_OUTPUT_DIR, DEFAULT_PROFILE_DIR, Settings
 from .crawler import Crawler
@@ -78,29 +79,59 @@ def cmd_render(args) -> int:
 
 def cmd_export(args) -> int:
     settings = _settings(args)
-    store = StateStore(settings.output_dir)
+    store: StateStore | None = StateStore(settings.output_dir)
     try:
         # One process, one Playwright context, one Chrome window from MitID
         # completion through the entire crawl. This avoids relying on Epic
         # session cookies surviving a browser close/reopen.
         with BrowserSession(settings, headless=args.non_interactive) as browser:
+            assert store is not None
             result = Crawler(settings, store).run(
                 interactive=not args.non_interactive,
                 expand_safe=not args.no_expand,
                 browser=browser,
+                checkpoint_probe=True,
             )
+            if result.checkpoint_interrupted:
+                # Deliberately tear down and reopen the durable crawl state
+                # after the first real page, while keeping the authenticated
+                # browser context alive. The resumed crawler must continue the
+                # same run without duplicating the captured artifact.
+                store.close()
+                store = StateStore(settings.output_dir)
+                result = Crawler(settings, store).run(
+                    interactive=not args.non_interactive,
+                    expand_safe=not args.no_expand,
+                    browser=browser,
+                    checkpoint_probe=True,
+                )
+                if not result.checkpoint_resumed:
+                    raise RuntimeError("checkpoint_probe_did_not_resume")
             crawl_rc = _print_crawl_result(result)
+
+        coverage_path = store.write_coverage_report(result.run_id)
+        print(coverage_path)
+        artifact_verification = store.verify_artifacts()
+        print(json.dumps(artifact_verification, ensure_ascii=False, indent=2))
+        if artifact_verification["errors"]:
+            raise RuntimeError("artifact_verification_failed")
 
         db_path = Normalizer(store).build()
         print(db_path)
         markdown_path = render_markdown(db_path, settings.markdown_path)
         print(markdown_path)
+        final_report_path = write_final_report(store, db_path, result.run_id)
+        print(final_report_path)
+        if crawl_rc == 0:
+            archive_path = build_complete_archive(store)
+            print(archive_path)
         return crawl_rc
     except AuthRequired as exc:
         print(str(exc), file=sys.stderr)
         return AUTH_REQUIRED_EXIT
     finally:
-        store.close()
+        if store is not None:
+            store.close()
 
 
 def cmd_status(args) -> int:

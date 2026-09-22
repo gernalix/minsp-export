@@ -97,6 +97,18 @@ class StateStore:
                 pages_done INTEGER NOT NULL DEFAULT 0,
                 errors INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE IF NOT EXISTS observations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                page_url TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                target_url TEXT NOT NULL DEFAULT '',
+                observed_at TEXT NOT NULL,
+                UNIQUE(run_id,page_url,kind,label,target_url)
+            );
+            CREATE INDEX IF NOT EXISTS idx_observations_run_kind
+                ON observations(run_id,kind);
             """
         )
         self.conn.commit()
@@ -147,6 +159,47 @@ class StateStore:
         )
         self.conn.execute("DELETE FROM meta WHERE key='active_run_id' AND value=?", (run_id,))
         self.conn.commit()
+
+    def prepare_tab_repair(self, run_id: str, labels: list[str]) -> int:
+        if not labels:
+            return 0
+        placeholders = ",".join("?" for _ in labels)
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT page_url
+            FROM observations
+            WHERE run_id=? AND kind IN ('control:tab','tab_error')
+              AND label IN ({placeholders})
+            """,
+            (run_id, *labels),
+        ).fetchall()
+        urls = [row["page_url"] for row in rows]
+        if not urls:
+            return 0
+        now = utc_now()
+        url_placeholders = ",".join("?" for _ in urls)
+        updated = self.conn.execute(
+            f"""
+            UPDATE pages
+            SET status='queued', tries=0, last_error=NULL, updated_at=?, run_id=?
+            WHERE url IN ({url_placeholders})
+            """,
+            (now, run_id, *urls),
+        ).rowcount
+        if updated:
+            self.conn.execute(
+                "UPDATE runs SET finished_at=NULL, errors=0 WHERE run_id=?",
+                (run_id,),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO meta(key,value) VALUES('active_run_id',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (run_id,),
+            )
+        self.conn.commit()
+        return int(updated)
 
     def enqueue(self, url: str, depth: int, run_id: str) -> bool:
         now = utc_now()
@@ -210,6 +263,37 @@ class StateStore:
         )
         self.conn.commit()
 
+    def observe(
+        self,
+        *,
+        run_id: str,
+        page_url: str,
+        kind: str,
+        label: str = "",
+        target_url: str = "",
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO observations
+            (run_id,page_url,kind,label,target_url,observed_at)
+            VALUES(?,?,?,?,?,?)
+            """,
+            (run_id, redact_url(page_url), kind[:80], label[:500], redact_url(target_url), utc_now()),
+        )
+        self.conn.commit()
+
+    def artifact_for_source(self, source_url: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            """
+            SELECT a.local_path,a.sha256,a.kind
+            FROM artifact_sources s
+            JOIN artifacts a ON a.sha256=s.sha256
+            WHERE s.source_url=?
+            ORDER BY s.id DESC LIMIT 1
+            """,
+            (redact_url(source_url),),
+        ).fetchone()
+
     def save_artifact(
         self,
         *,
@@ -236,7 +320,7 @@ class StateStore:
                 pass
         rel = str(path.relative_to(self.root))
         now = utc_now()
-        self.conn.execute(
+        artifact_insert = self.conn.execute(
             """
             INSERT OR IGNORE INTO artifacts(sha256,kind,local_path,content_type,bytes,first_seen_at)
             VALUES(?,?,?,?,?,?)
@@ -248,18 +332,103 @@ class StateStore:
             (digest, redact_url(source_url or ""), now),
         )
         self.conn.commit()
-        manifest = {
-            "sha256": digest,
-            "kind": kind,
-            "path": rel,
-            "bytes": len(data),
-            "content_type": content_type,
-            "source_url": redact_url(source_url or ""),
-            "captured_at": now,
-        }
-        with (self.root / "manifests" / "files.jsonl").open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
+        if artifact_insert.rowcount:
+            manifest = {
+                "bytes": len(data),
+                "captured_at": now,
+                "content_type": content_type,
+                "kind": kind,
+                "path": rel,
+                "sha256": digest,
+                "source_url": redact_url(source_url or ""),
+            }
+            with (self.root / "manifests" / "files.jsonl").open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
         return path, digest
+
+    def rebuild_manifest(self) -> Path:
+        path = self.root / "manifests" / "files.jsonl"
+        tmp = path.with_name(path.name + ".tmp")
+        rows = self.conn.execute(
+            """
+            SELECT a.sha256,a.kind,a.local_path,a.content_type,a.bytes,a.first_seen_at,
+                   COALESCE((SELECT s.source_url FROM artifact_sources s
+                             WHERE s.sha256=a.sha256 ORDER BY s.id LIMIT 1),'') AS source_url
+            FROM artifacts a ORDER BY a.sha256
+            """
+        ).fetchall()
+        with tmp.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                item = {
+                    "bytes": row["bytes"],
+                    "captured_at": row["first_seen_at"],
+                    "content_type": row["content_type"],
+                    "kind": row["kind"],
+                    "path": row["local_path"],
+                    "sha256": row["sha256"],
+                    "source_url": row["source_url"],
+                }
+                fh.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
+        os.replace(tmp, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return path
+
+    def verify_artifacts(self) -> dict[str, object]:
+        errors: list[str] = []
+        rows = self.conn.execute(
+            "SELECT sha256,local_path,bytes FROM artifacts ORDER BY sha256"
+        ).fetchall()
+        for row in rows:
+            path = self.root / row["local_path"]
+            if not path.is_file():
+                errors.append(f"missing:{row['local_path']}")
+                continue
+            data = path.read_bytes()
+            if len(data) != row["bytes"]:
+                errors.append(f"size:{row['local_path']}")
+            if sha256_bytes(data) != row["sha256"]:
+                errors.append(f"sha256:{row['local_path']}")
+        self.rebuild_manifest()
+        manifest = self.root / "manifests" / "files.jsonl"
+        manifest_rows = sum(1 for line in manifest.read_text(encoding="utf-8").splitlines() if line)
+        if manifest_rows != len(rows):
+            errors.append(f"manifest_count:{manifest_rows}!={len(rows)}")
+        return {"artifacts": len(rows), "manifest_rows": manifest_rows, "errors": errors}
+
+    def write_coverage_report(self, run_id: str) -> Path:
+        path = self.root / "manifests" / "coverage.json"
+        page_rows = self.conn.execute(
+            "SELECT url,status,title,last_error FROM pages WHERE run_id=? ORDER BY url",
+            (run_id,),
+        ).fetchall()
+        observation_rows = self.conn.execute(
+            """
+            SELECT page_url,kind,label,target_url FROM observations
+            WHERE run_id=? ORDER BY page_url,kind,label,target_url
+            """,
+            (run_id,),
+        ).fetchall()
+        pages = []
+        for row in page_rows:
+            item = dict(row)
+            item["url"] = redact_url(item["url"])
+            pages.append(item)
+        payload = {
+            "run_id": run_id,
+            "pages": pages,
+            "observations": [dict(row) for row in observation_rows],
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+        return path
 
     def summary(self) -> dict[str, object]:
         page_counts = {
