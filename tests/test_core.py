@@ -181,6 +181,36 @@ class StateTests(unittest.TestCase):
             self.assertEqual(len(report["observations"]), 1)
             store.close()
 
+    def test_tab_repair_resumes_only_pages_that_observed_the_missing_tab(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(Path(tmp))
+            run_id, _ = store.begin_run()
+            target = "https://minsundhedsplatform.dk/mychartppr1/app/access-logs"
+            other = "https://minsundhedsplatform.dk/mychartppr1/app/results"
+            for url in (target, other):
+                store.enqueue(url, 0, run_id)
+                store.mark_page_done(url, title="done", local_path="", digest="")
+            store.observe(
+                run_id=run_id,
+                page_url=target,
+                kind="control:tab",
+                label="Third-party apps",
+            )
+            store.finish_run(run_id)
+
+            self.assertEqual(store.prepare_tab_repair(run_id, ["Third-party apps"]), 1)
+            self.assertEqual(store.get_meta("active_run_id"), run_id)
+            queued = store.conn.execute(
+                "SELECT url FROM pages WHERE run_id=? AND status='queued'",
+                (run_id,),
+            ).fetchall()
+            self.assertEqual([row["url"] for row in queued], [target])
+            self.assertEqual(
+                store.conn.execute("SELECT status FROM pages WHERE url=?", (other,)).fetchone()[0],
+                "done",
+            )
+            store.close()
+
 
 class NormalizationTests(unittest.TestCase):
     def test_lab_classification(self):
@@ -351,6 +381,37 @@ class ArchiveTests(unittest.TestCase):
             db_path = Normalizer(store).build()
             with self.assertRaisesRegex(RuntimeError, "read_only_tab_coverage_incomplete"):
                 write_final_report(store, db_path, run_id)
+            store.close()
+
+    def test_unavailable_read_only_tab_is_reported_as_not_exposed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "export"
+            store = StateStore(root)
+            run_id, _ = store.begin_run()
+            page_url = "https://minsundhedsplatform.dk/mychartppr1/app/access-logs"
+            store.enqueue(page_url, 0, run_id)
+            store.mark_page_done(page_url, title="Access", local_path="", digest="")
+            store.observe(
+                run_id=run_id,
+                page_url=page_url,
+                kind="control:tab",
+                label="Third-party apps",
+            )
+            store.observe(
+                run_id=run_id,
+                page_url=page_url,
+                kind="tab_unavailable",
+                label="Third-party apps",
+            )
+            store.finish_run(run_id)
+            db_path = Normalizer(store).build()
+            report_path = write_final_report(store, db_path, run_id)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(report["read_only_tabs"]["missing"], [])
+            self.assertEqual(
+                report["read_only_tabs"]["not_exposed_or_not_actionable"],
+                ["Third-party apps"],
+            )
             store.close()
 
 

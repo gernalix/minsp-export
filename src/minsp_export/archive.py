@@ -114,7 +114,16 @@ def write_final_report(store: StateStore, db_path: Path, run_id: str) -> Path:
             (run_id,),
         )
     }
-    missing_tabs = sorted((observed_tabs | errored_tabs) - snapshotted_tabs)
+    unavailable_tabs = {
+        row["label"]
+        for row in store.conn.execute(
+            "SELECT DISTINCT label FROM observations WHERE run_id=? AND kind='tab_unavailable' AND label<>''",
+            (run_id,),
+        )
+    }
+    missing_tabs = sorted(
+        (observed_tabs | errored_tabs) - snapshotted_tabs - unavailable_tabs
+    )
     db = sqlite3.connect(db_path)
     try:
         domain_tables = (
@@ -157,6 +166,7 @@ def write_final_report(store: StateStore, db_path: Path, run_id: str) -> Path:
         "read_only_tabs": {
             "observed": sorted(observed_tabs),
             "snapshotted": sorted(snapshotted_tabs),
+            "not_exposed_or_not_actionable": sorted(unavailable_tabs),
             "missing": missing_tabs,
         },
     }
@@ -182,6 +192,7 @@ def write_final_report(store: StateStore, db_path: Path, run_id: str) -> Path:
     path = store.root / "manifests" / "final-report.json"
     _write_private_json(path, report)
     if missing_tabs:
+        store.prepare_tab_repair(run_id, missing_tabs)
         raise RuntimeError("read_only_tab_coverage_incomplete:" + ",".join(missing_tabs))
     return path
 

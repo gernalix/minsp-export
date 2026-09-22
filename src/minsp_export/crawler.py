@@ -286,23 +286,58 @@ class Crawler:
             try:
                 tabs = frame.locator("[role=tab]")
                 initial_count = min(tabs.count(), max_tabs - clicked)
-            except Exception:
-                continue
-            for index in range(initial_count):
-                label = f"index:{index}"
-                try:
-                    # Re-query after every click because Epic commonly
-                    # re-renders the entire tablist.
-                    locator = frame.locator("[role=tab]").nth(index)
+                labels = []
+                for index in range(initial_count):
+                    locator = tabs.nth(index)
                     label = " ".join(
                         (locator.get_attribute("aria-label") or locator.inner_text() or "").split()
                     )
+                    if label and label not in labels:
+                        labels.append(label)
+            except Exception:
+                continue
+            for label in labels:
+                try:
                     identity = (frame.url, label)
-                    if not label or identity in seen:
-                        continue
-                    if not locator.is_visible() or not locator.is_enabled():
+                    if identity in seen:
                         continue
                     seen.add(identity)
+
+                    # Resolve by label after every click. Epic re-renders the
+                    # whole tablist, so retaining an index can silently point
+                    # at a different or temporarily empty element.
+                    locator = None
+                    for _ in range(3):
+                        current = frame.locator("[role=tab]")
+                        for index in range(min(current.count(), max_tabs)):
+                            candidate = current.nth(index)
+                            candidate_label = " ".join(
+                                (
+                                    candidate.get_attribute("aria-label")
+                                    or candidate.inner_text()
+                                    or ""
+                                ).split()
+                            )
+                            if candidate_label == label:
+                                try:
+                                    candidate.scroll_into_view_if_needed(timeout=1200)
+                                except Exception:
+                                    pass
+                                if candidate.is_visible() and candidate.is_enabled():
+                                    locator = candidate
+                                break
+                        if locator is not None:
+                            break
+                        page.wait_for_timeout(250)
+                    if locator is None:
+                        self.store.observe(
+                            run_id=run_id,
+                            page_url=page.url,
+                            kind="tab_unavailable",
+                            label=label,
+                        )
+                        continue
+
                     locator.click(timeout=2500)
                     page.wait_for_timeout(450)
                     _settle_and_scroll(page, self.settings.settle_ms)

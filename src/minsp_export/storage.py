@@ -160,6 +160,47 @@ class StateStore:
         self.conn.execute("DELETE FROM meta WHERE key='active_run_id' AND value=?", (run_id,))
         self.conn.commit()
 
+    def prepare_tab_repair(self, run_id: str, labels: list[str]) -> int:
+        if not labels:
+            return 0
+        placeholders = ",".join("?" for _ in labels)
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT page_url
+            FROM observations
+            WHERE run_id=? AND kind IN ('control:tab','tab_error')
+              AND label IN ({placeholders})
+            """,
+            (run_id, *labels),
+        ).fetchall()
+        urls = [row["page_url"] for row in rows]
+        if not urls:
+            return 0
+        now = utc_now()
+        url_placeholders = ",".join("?" for _ in urls)
+        updated = self.conn.execute(
+            f"""
+            UPDATE pages
+            SET status='queued', tries=0, last_error=NULL, updated_at=?, run_id=?
+            WHERE url IN ({url_placeholders})
+            """,
+            (now, run_id, *urls),
+        ).rowcount
+        if updated:
+            self.conn.execute(
+                "UPDATE runs SET finished_at=NULL, errors=0 WHERE run_id=?",
+                (run_id,),
+            )
+            self.conn.execute(
+                """
+                INSERT INTO meta(key,value) VALUES('active_run_id',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                (run_id,),
+            )
+        self.conn.commit()
+        return int(updated)
+
     def enqueue(self, url: str, depth: int, run_id: str) -> bool:
         now = utc_now()
         row = self.conn.execute("SELECT run_id,status FROM pages WHERE url=?", (url,)).fetchone()
