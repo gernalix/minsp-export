@@ -148,66 +148,104 @@ class Crawler:
         except Exception:
             return
 
-    def run(self, *, interactive: bool = True, expand_safe: bool = True) -> CrawlResult:
+    def run(
+        self,
+        *,
+        interactive: bool = True,
+        expand_safe: bool = True,
+        browser: BrowserSession | None = None,
+    ) -> CrawlResult:
         run_id, resumed = self.store.begin_run()
+
+        if browser is not None:
+            return self._run_with_browser(
+                browser,
+                run_id=run_id,
+                resumed=resumed,
+                interactive=interactive,
+                expand_safe=expand_safe,
+            )
+
+        with BrowserSession(self.settings, headless=not interactive) as owned_browser:
+            return self._run_with_browser(
+                owned_browser,
+                run_id=run_id,
+                resumed=resumed,
+                interactive=interactive,
+                expand_safe=expand_safe,
+            )
+
+    def _run_with_browser(
+        self,
+        browser: BrowserSession,
+        *,
+        run_id: str,
+        resumed: bool,
+        interactive: bool,
+        expand_safe: bool,
+    ) -> CrawlResult:
         visited = 0
+        page = browser.page
+        assert page is not None
+        page.on("response", self._capture_response)
 
-        with BrowserSession(self.settings, headless=not interactive) as browser:
-            page = browser.page
-            assert page is not None
-            page.on("response", self._capture_response)
-            start_url = canonical_url(browser.ensure_authenticated(interactive=interactive))
-            if eligible_url(start_url):
-                self.store.enqueue(start_url, 0, run_id)
+        # Authentication and the crawl intentionally share the exact same
+        # BrowserSession. Do not close/reopen Chrome between MitID and crawling.
+        start_url = canonical_url(browser.ensure_authenticated(interactive=interactive))
+        if eligible_url(start_url):
+            self.store.enqueue(start_url, 0, run_id)
 
-            for href in _extract_hrefs(page):
-                absolute = canonical_url(urljoin(page.url, href))
-                if eligible_url(absolute):
-                    self.store.enqueue(absolute, 1, run_id)
+        for href in _extract_hrefs(page):
+            absolute = canonical_url(urljoin(page.url, href))
+            if eligible_url(absolute):
+                self.store.enqueue(absolute, 1, run_id)
 
-            while visited < self.settings.max_pages:
-                rows = self.store.pending(run_id, self.settings.max_retries, limit=1)
-                if not rows:
-                    break
-                row = rows[0]
-                url = row["url"]
-                depth = int(row["depth"])
-                try:
+        while visited < self.settings.max_pages:
+            rows = self.store.pending(run_id, self.settings.max_retries, limit=1)
+            if not rows:
+                break
+            row = rows[0]
+            url = row["url"]
+            depth = int(row["depth"])
+            try:
+                page.goto(url, wait_until="domcontentloaded")
+                if not browser.is_authenticated_portal_url(page.url):
+                    # If the portal expired the session, recover inside this
+                    # same browser context. A fresh MitID login is requested
+                    # only when the portal actually requires it.
+                    browser.ensure_authenticated(interactive=interactive)
                     page.goto(url, wait_until="domcontentloaded")
-                    if browser.looks_logged_out(page.url):
-                        browser.ensure_authenticated(interactive=interactive)
-                        page.goto(url, wait_until="domcontentloaded")
 
+                _settle_and_scroll(page, self.settings.settle_ms)
+                if expand_safe and _safe_reveal(page):
                     _settle_and_scroll(page, self.settings.settle_ms)
-                    if expand_safe and _safe_reveal(page):
-                        _settle_and_scroll(page, self.settings.settle_ms)
 
-                    html = page.content().encode("utf-8")
-                    path, digest = self.store.save_artifact(
-                        kind="html",
-                        data=html,
-                        source_url=url,
-                        content_type="text/html; charset=utf-8",
-                        extension=".html",
-                    )
-                    title = page.title()
-                    self.store.mark_page_done(
-                        url,
-                        title=title,
-                        local_path=str(path.relative_to(self.store.root)),
-                        digest=digest,
-                    )
+                html = page.content().encode("utf-8")
+                path, digest = self.store.save_artifact(
+                    kind="html",
+                    data=html,
+                    source_url=url,
+                    content_type="text/html; charset=utf-8",
+                    extension=".html",
+                )
+                title = page.title()
+                self.store.mark_page_done(
+                    url,
+                    title=title,
+                    local_path=str(path.relative_to(self.store.root)),
+                    digest=digest,
+                )
 
-                    if depth < self.settings.max_depth:
-                        for href in _extract_hrefs(page):
-                            absolute = canonical_url(urljoin(page.url, href))
-                            if eligible_url(absolute):
-                                self.store.enqueue(absolute, depth + 1, run_id)
-                    visited += 1
-                except AuthRequired:
-                    raise
-                except Exception as exc:
-                    self.store.mark_page_error(url, f"{type(exc).__name__}: {exc}")
+                if depth < self.settings.max_depth:
+                    for href in _extract_hrefs(page):
+                        absolute = canonical_url(urljoin(page.url, href))
+                        if eligible_url(absolute):
+                            self.store.enqueue(absolute, depth + 1, run_id)
+                visited += 1
+            except AuthRequired:
+                raise
+            except Exception as exc:
+                self.store.mark_page_error(url, f"{type(exc).__name__}: {exc}")
 
         pending = self.store.pending_count(run_id, self.settings.max_retries)
         exhausted = self.store.exhausted_error_count(run_id, self.settings.max_retries)
