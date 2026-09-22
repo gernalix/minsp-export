@@ -6,10 +6,34 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from minsp_export.browser import BrowserSession
 from minsp_export.crawler import canonical_url, eligible_url, response_kind
 from minsp_export.normalize import Normalizer, classify_dict
 from minsp_export.render import search
 from minsp_export.storage import StateStore, redact_url
+
+
+class BrowserAuthUrlTests(unittest.TestCase):
+    def test_authenticated_portal_page_is_recognized(self):
+        self.assertTrue(
+            BrowserSession.is_authenticated_portal_url(
+                "https://minsundhedsplatform.dk/mychartppr1/app/testresults"
+            )
+        )
+
+    def test_login_page_is_not_authenticated(self):
+        self.assertFalse(
+            BrowserSession.is_authenticated_portal_url(
+                "https://minsundhedsplatform.dk/mychartppr1/Authentication/Login?"
+            )
+        )
+
+    def test_external_mitid_page_is_not_authenticated(self):
+        self.assertFalse(
+            BrowserSession.is_authenticated_portal_url(
+                "https://www.mitid.dk/mitid-core-client/"
+            )
+        )
 
 
 class UrlPolicyTests(unittest.TestCase):

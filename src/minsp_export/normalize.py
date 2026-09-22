@@ -134,7 +134,7 @@ def classify_dict(obj: dict[str, Any], source_url: str = "") -> str | None:
         return "clinical_note"
 
     direct_scalar_count = sum(
-        _scalar(value) not in (None, "") for value in obj.values()
+        1 for value in obj.values() if _scalar(value) not in (None, "")
     )
     for category, hints in CATEGORY_HINTS.items():
         if any(h in source_url.lower() for h in hints) and direct_scalar_count >= 3:

@@ -50,10 +50,11 @@ Install the package using the system/user Python policy you already use on Fedor
 ```bash
 # From the repository root
 python3 -m pip install --user -e .
-minsp-export login
+# Normal workflow: opens Chrome, lets you complete MitID if needed, then
+# keeps that SAME browser session alive through the complete crawl.
 minsp-export export
 
-# Resume an interrupted crawl
+# Resume an interrupted crawl in one browser session
 minsp-export crawl
 
 # Rebuild normalized outputs without revisiting the site
@@ -65,7 +66,7 @@ minsp-export status
 minsp-export search ferritin
 ```
 
-`minsp-export login` opens the dedicated persistent browser profile. Complete MitID normally. `export` can also wait for interactive login itself.
+`minsp-export export` is the normal workflow. If authentication is required it opens the dedicated Chrome profile, waits for manual MitID, verifies that Chrome has actually returned to an authenticated Min Sundhedsplatform URL, and continues crawling in that same browser context without closing/reopening Chrome. The separate `login` command is diagnostic only and should not be used as a pre-step for an export.
 
 For unattended/incremental runs use:
 

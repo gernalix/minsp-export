@@ -24,12 +24,21 @@ def _settings(args) -> Settings:
     )
 
 
+def _print_crawl_result(result) -> int:
+    print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+    return 2 if result.exhausted_errors else 0
+
+
 def cmd_login(args) -> int:
     settings = _settings(args)
     secure_dir(settings.profile_dir)
     with BrowserSession(settings, headless=False) as browser:
         url = browser.ensure_authenticated(interactive=True)
         print(f"AUTHENTICATED: {url}")
+        print(
+            "Diagnostic login completed. For a real export use minsp-export export, "
+            "which keeps this same browser session alive through the crawl."
+        )
     return 0
 
 
@@ -41,10 +50,7 @@ def cmd_crawl(args) -> int:
             interactive=not args.non_interactive,
             expand_safe=not args.no_expand,
         )
-        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
-        if result.exhausted_errors:
-            return 2
-        return 0
+        return _print_crawl_result(result)
     except AuthRequired as exc:
         print(str(exc), file=sys.stderr)
         return AUTH_REQUIRED_EXIT
@@ -71,14 +77,30 @@ def cmd_render(args) -> int:
 
 
 def cmd_export(args) -> int:
-    crawl_rc = cmd_crawl(args)
-    if crawl_rc not in (0, 2):
+    settings = _settings(args)
+    store = StateStore(settings.output_dir)
+    try:
+        # One process, one Playwright context, one Chrome window from MitID
+        # completion through the entire crawl. This avoids relying on Epic
+        # session cookies surviving a browser close/reopen.
+        with BrowserSession(settings, headless=args.non_interactive) as browser:
+            result = Crawler(settings, store).run(
+                interactive=not args.non_interactive,
+                expand_safe=not args.no_expand,
+                browser=browser,
+            )
+            crawl_rc = _print_crawl_result(result)
+
+        db_path = Normalizer(store).build()
+        print(db_path)
+        markdown_path = render_markdown(db_path, settings.markdown_path)
+        print(markdown_path)
         return crawl_rc
-    norm_rc = cmd_normalize(args)
-    if norm_rc:
-        return norm_rc
-    render_rc = cmd_render(args)
-    return crawl_rc or render_rc
+    except AuthRequired as exc:
+        print(str(exc), file=sys.stderr)
+        return AUTH_REQUIRED_EXIT
+    finally:
+        store.close()
 
 
 def cmd_status(args) -> int:
@@ -114,12 +136,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile", default=str(DEFAULT_PROFILE_DIR))
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("login", help="Open the dedicated Chrome profile and complete MitID manually")
+    sub.add_parser(
+        "login",
+        help="Diagnostic manual MitID login; use export for the normal one-login workflow",
+    )
 
     for name in ("crawl", "export"):
         p = sub.add_parser(name, help=f"{name.capitalize()} portal data")
-        p.add_argument("--non-interactive", action="store_true", help="Never wait for MitID; exit 10 if login is required")
-        p.add_argument("--no-expand", action="store_true", help="Do not click exact read-only show-more controls")
+        p.add_argument(
+            "--non-interactive",
+            action="store_true",
+            help="Never wait for MitID; exit 10 if login is required",
+        )
+        p.add_argument(
+            "--no-expand",
+            action="store_true",
+            help="Do not click exact read-only show-more controls",
+        )
         p.add_argument("--max-pages", type=int, default=10_000)
 
     sub.add_parser("normalize", help="Build normalized health.sqlite from captured raw artifacts")
