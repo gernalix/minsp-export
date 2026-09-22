@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minsp-export"
+version = "0.1.0"
+description = "Resumable local exporter for Min Sundhedsplatform / Epic MyChart"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "playwright>=1.50,<2",
+]
+
+[project.scripts]
+minsp-export = "minsp_export.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
