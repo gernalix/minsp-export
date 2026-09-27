@@ -1,0 +1,101 @@
+schema_version: c2.project-capsule.v1
+identity:
+  project_id: 101
+  slug: minsp-export
+  repository_id: R0102
+scope:
+  purpose: Export read-only health information visible to the authenticated Min Sundhedsplatform user into resumable local raw and searchable outputs.
+  boundaries:
+    - MegaVault owns canonical project identity and repository location.
+    - C2 owns work-item lifecycle and execution receipts.
+    - Authentication and the portal remain user-controlled external systems; the exporter does not automate MitID or account mutations.
+repository:
+  canonical_workdir: /home/daniele/projects/minsp-export
+  branch_policy: Canonical repository follows origin/main; make changes in isolated repo-task worktrees and integrate through the guarded single-writer lane.
+architecture:
+  summary: A Python CLI uses a persistent Chrome profile for manual authentication, navigates read-only portal pages, checkpoints raw artifacts in SQLite, then builds normalized searchable outputs and an allowlisted archive.
+  entrypoints:
+    - src/minsp_export/cli.py
+    - src/minsp_export/__main__.py
+  important_paths:
+    - src/minsp_export
+    - tests
+    - docs
+    - SECURITY.md
+dependencies:
+  - name: Python standard library
+    purpose: CLI, SQLite checkpoint state, normalization, rendering, and archive generation.
+  - name: Playwright
+    purpose: Control the dedicated Chrome session after manual user authentication.
+  - name: Google Chrome stable
+    purpose: Persistent user-controlled browser session; no credentials are automated or stored by the project.
+  - name: pdftotext (optional)
+    purpose: Extract searchable text from captured PDFs.
+data:
+  schema: Runtime export stores raw HTML, JSON, PDF and attachments plus state.sqlite and normalized/health.sqlite under ~/Documents/MinSP/export by default. Local files contain sensitive health data. Raw artifacts are authoritative; normalized outputs are derived.
+  migrations: Runtime SQLite tables are initialized by minsp_export.storage.StateStore; no repository migration framework is defined.
+runtime:
+  services: []
+  timers: []
+  containers: []
+devices: []
+commands:
+  setup:
+    not_applicable: Python package and browser dependencies are installed in the user's managed environment; this repository has no setup or virtual-environment script.
+  build:
+    not_applicable: Python package is installed directly; there is no compiled build artifact.
+  test_targeted:
+    argv: [python3, -B, -m, unittest, discover, -s, tests, -q]
+    cwd: .
+  test_full:
+    argv: [python3, -B, -m, unittest, discover, -s, tests, -q]
+    cwd: .
+  lint:
+    argv: [git, diff, --check]
+    cwd: .
+  deploy_install:
+    not_applicable: This is a local user-invoked application; there is no service deployment or installation step owned by the repository.
+  smoke:
+    not_applicable: Real portal smoke validation requires the user's authenticated account and manual MitID, and is a separately gated operation.
+  verify:
+    fast:
+      argv: [python3, /home/daniele/projects/codex-roadmap/tools/project_capsule.py, --repo, ., --mode, FAST]
+      cwd: .
+    full:
+      argv: [python3, /home/daniele/projects/codex-roadmap/tools/project_capsule.py, --repo, ., --mode, FULL]
+      cwd: .
+safety:
+  invariants:
+    - MitID authentication is completed manually by the user; never automate, intercept, replay, or persist MitID credentials.
+    - Crawl only same-origin read-only portal navigation; never submit forms or mutate the account.
+    - Never commit raw exports, SQLite data, browser profiles, cookies, credentials, request headers, or authentication material.
+    - Raw artifacts remain authoritative immutable inputs; normalization and packaging must not delete or replace them.
+    - Keep health exports local and encrypted, including backups.
+  risky_operations:
+    - export and crawl access authenticated health information and write sensitive local files; only run with explicit user intent and the real authenticated browser.
+    - normalize, render, and search can expose health information from the local archive; do not use a user's real archive for validation.
+    - live completeness validation requires manual MitID and a separately authorized authenticated session; no such validation is included here.
+  recovery:
+    - Crawl state in state.sqlite checkpoints progress for later resume in the same authenticated browser session.
+    - Raw files are the source of truth and normalized/search outputs can be rebuilt from them; the allowlisted ZIP excludes profiles and logs.
+acceptance:
+  - Capsule FAST and FULL validators pass against the reviewed integrated repository head.
+  - Unit tests pass using temporary data and mocked browser/network objects without opening the live portal or reading health exports.
+  - Real portal coverage is not claimed by this source-only adoption; it requires the separate manual-authentication validation contract.
+references:
+  megavault: /home/daniele/MegaVault/megavault.sqlite
+  c2: /home/daniele/projects/codex-roadmap/roadmap.sqlite
+freshness:
+  reviewed_commit: 67e3af3d17f395ba4755060fc9fa45457e4d0cdc
+  watch_paths:
+    - src
+    - tests
+    - docs
+    - pyproject.toml
+    - SECURITY.md
+artifacts:
+  agents: AGENTS.md
+validation_hooks: []
+change_verification:
+  - paths: [src/**, tests/**, docs/**, pyproject.toml, SECURITY.md, AGENTS.md, project-capsule.yaml]
+    commands: [test_targeted]
