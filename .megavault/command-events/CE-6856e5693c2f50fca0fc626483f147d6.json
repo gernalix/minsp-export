@@ -1,0 +1,39 @@
+{
+  "action": "upsert",
+  "contract_version": "megavault.command/v1",
+  "event_id": "CE-6856e5693c2f50fca0fc626483f147d6",
+  "occurred_at": "2026-10-12T21:16:23.822773+00:00",
+  "operation_key": "status",
+  "payload": {
+    "argv": [
+      "status"
+    ],
+    "contract_version": "megavault.command/v1",
+    "description": "Read private MinSP export progress; disabled until output handling is approved for health data.",
+    "entrypoint": "minsp-export",
+    "host_scope": "H0001",
+    "idempotency": "read_only",
+    "input_schema": {
+      "additionalProperties": false,
+      "properties": {},
+      "required": [],
+      "type": "object"
+    },
+    "key": "status",
+    "owner": "minsp-export",
+    "prerequisites": [
+      "Installed owner CLI and readable private export state"
+    ],
+    "project_id": 101,
+    "risk": "high",
+    "source_digest": "d60bf2645a60a048c74c8a2d753f48863b3ace51e77559f2ef219eaed09cd30c",
+    "source_ref": "/home/daniele/.local/share/codex-github-autosync/worktrees/gernalix_minsp-export/P104/.megavault/commands-v1.json",
+    "state": "disabled",
+    "timeout_seconds": 30,
+    "working_directory": "."
+  },
+  "payload_sha256": "d60bf2645a60a048c74c8a2d753f48863b3ace51e77559f2ef219eaed09cd30c",
+  "project_id": 101,
+  "source_commit": "c591b1675418796aae1f4a4bfae46b9b62595eba",
+  "source_ref": "/home/daniele/.local/share/codex-github-autosync/worktrees/gernalix_minsp-export/P104/.megavault/commands-v1.json"
+}
