@@ -1,0 +1,26 @@
+{
+  "contract_version": "megavault.command/v1",
+  "project_id": 101,
+  "owner": "minsp-export",
+  "commands": [
+    {
+      "key": "status",
+      "host_scope": "H0001",
+      "entrypoint": "minsp-export",
+      "argv": ["status"],
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "working_directory": ".",
+      "prerequisites": ["Installed owner CLI and readable private export state"],
+      "timeout_seconds": 30,
+      "idempotency": "read_only",
+      "risk": "high",
+      "state": "disabled",
+      "description": "Read private MinSP export progress; disabled until output handling is approved for health data."
+    }
+  ]
+}
