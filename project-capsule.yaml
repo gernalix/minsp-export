@@ -189,7 +189,7 @@ references:
   megavault: /home/daniele/MegaVault/megavault.sqlite
   c2: Historical-only format reference; no runtime or lifecycle dependency.
 freshness:
-  reviewed_commit: 50d854c9a450c1343d037b86a1324956c83c2f4f
+  reviewed_commit: 020c5772c03dba95f9ce90b022fa42869a6948be
   watch_paths:
   - src
   - tests
