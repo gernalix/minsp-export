@@ -1,7 +1,7 @@
 # minsp-export
 
 ## Purpose
-This repository builds a resumable local archive from read-only pages available to the authenticated Min Sundhedsplatform user. MegaVault owns project identity and repository location; C2 owns task lifecycle. The live portal, MitID and Chrome are external user-controlled systems.
+This repository builds a resumable local archive from read-only pages available to the authenticated Min Sundhedsplatform user. MegaVault owns project identity and repository location; C2/C3 are frozen references; use the existing Git owner for source work. The live portal, MitID and Chrome are external user-controlled systems.
 
 ## Architecture and data
 `src/minsp_export/cli.py` exposes the CLI. `browser.py` manages the persistent Chrome profile, `crawler.py` captures same-origin pages and supported payloads, `storage.py` checkpoints raw artifacts, and `normalize.py`, `render.py` and `archive.py` build local projections and allowlisted output. Raw captures remain authoritative. See `README.md`, `SECURITY.md` and `docs/REAL_VALIDATION.md`.
