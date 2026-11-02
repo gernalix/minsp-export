@@ -91,6 +91,6 @@ If authentication is required it exits with code **10** instead of attempting to
 
 ## Completeness
 
-The crawler stores every page and supported network payload it observes and can resume safely, but MyChart installations differ and some sections are JavaScript-driven. The repository therefore separates generic capture from site-specific adapters. A real authenticated reconnaissance pass is required to prove coverage of every section exposed by this Min Sundhedsplatform deployment. That live verification belongs in the Codex roadmap task generated for this project.
+The crawler stores every page and supported network payload it observes and can resume safely, but MyChart installations differ and some sections are JavaScript-driven. The repository therefore separates generic capture from site-specific adapters. A real authenticated reconnaissance pass is required to prove coverage of every section exposed by this Min Sundhedsplatform deployment. That live verification requires a separately authorized runtime task; source checks do not open the portal or require the retired C2/C3 roadmap.
 
 Also note that “everything Min Sundhedsplatform exposes” is not necessarily the complete hospital record; information not made available in the portal cannot be recovered by this exporter.
