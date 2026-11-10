@@ -19,6 +19,16 @@ from minsp_export.storage import StateStore, redact_url
 
 
 class BrowserAuthUrlTests(unittest.TestCase):
+    def test_capture_requires_exact_https_origin(self):
+        for url in (
+            "http://minsundhedsplatform.dk/mychartppr1/app/home",
+            "https://minsundhedsplatform.dk:8443/mychartppr1/app/home",
+            "https://fixture@minsundhedsplatform.dk/mychartppr1/app/home",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(BrowserSession.is_authenticated_portal_url(url))
+                self.assertFalse(eligible_url(url))
+        self.assertTrue(eligible_url("https://minsundhedsplatform.dk:443/mychartppr1/app/home"))
     def test_authenticated_portal_page_is_recognized(self):
         self.assertTrue(
             BrowserSession.is_authenticated_portal_url(
@@ -87,9 +97,21 @@ class UrlPolicyTests(unittest.TestCase):
         response = MagicMock()
         response.status = 200
         response.url = "https://www.mitid.dk/mitid-core-client/state.json"
+        crawler._capture_page = MagicMock()
+        crawler._capture_page.url = "https://minsundhedsplatform.dk/mychartppr1/app/home"
+        response.frame = crawler._capture_page.main_frame
         crawler._capture_response(response)
         store.observe.assert_not_called()
         store.save_artifact.assert_not_called()
+
+    def test_crawl_guard_blocks_mutating_requests(self):
+        crawler = Crawler(MagicMock(), MagicMock())
+        crawler._capture_page = MagicMock()
+        route = MagicMock()
+        route.request.method = "POST"
+        crawler._guard_request(route)
+        route.abort.assert_called_once()
+        route.continue_.assert_not_called()
 
     def test_portal_initiated_cdn_download_is_captured(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -104,12 +126,29 @@ class UrlPolicyTests(unittest.TestCase):
             download.page.url = "https://minsundhedsplatform.dk/mychartppr1/app/documents"
             download.path.return_value = downloaded
             download.suggested_filename = "record.pdf"
-            crawler._capture_download(download)
+            page = download.page
+            anchor = page.locator.return_value
+            anchor.count.return_value = 1
+            anchor.nth.return_value.get_attribute.return_value = download.url
+            anchor.nth.return_value.evaluate.return_value = download.url
+            pending = page.expect_download.return_value.__enter__.return_value
+            pending.value = download
+            crawler._trigger_explicit_downloads(page)
             self.assertEqual(
                 store.conn.execute("SELECT COUNT(*) FROM artifacts WHERE kind='pdf'").fetchone()[0],
                 1,
             )
             store.close()
+
+    def test_download_from_other_page_is_not_read(self):
+        crawler = Crawler(MagicMock(), MagicMock())
+        page = MagicMock()
+        page.url = "https://minsundhedsplatform.dk/mychartppr1/app/documents"
+        download = MagicMock()
+        download.url = "https://cdn.example.invalid/document/123"
+        crawler._capture_download(download, page=page, page_url=page.url, expected=download.url)
+        download.path.assert_not_called()
+        crawler.store.save_artifact.assert_not_called()
 
 
 class StateTests(unittest.TestCase):
@@ -269,7 +308,7 @@ class NormalizationTests(unittest.TestCase):
 
 class ReadOnlyTabTests(unittest.TestCase):
     @patch("minsp_export.crawler._extract_hrefs", return_value=[])
-    @patch("minsp_export.crawler._trigger_explicit_downloads", return_value=0)
+    @patch("minsp_export.crawler.Crawler._trigger_explicit_downloads", return_value=0)
     @patch("minsp_export.crawler._safe_reveal", return_value=0)
     @patch("minsp_export.crawler._settle_and_scroll")
     def test_role_tab_is_clicked_and_snapshotted(
@@ -283,15 +322,19 @@ class ReadOnlyTabTests(unittest.TestCase):
         tab.inner_text.return_value = "Appointments"
         tab.is_visible.return_value = True
         tab.is_enabled.return_value = True
+        tab.count.return_value = 1
+        tab.evaluate.return_value = True
         tabs = MagicMock()
         tabs.count.return_value = 1
         tabs.nth.return_value = tab
         frame = MagicMock()
         frame.url = "https://minsundhedsplatform.dk/mychartppr1/app/home"
         frame.locator.return_value = tabs
+        frame.get_by_role.return_value = tab
         frame.content.return_value = "<html>Appointments</html>"
         page = MagicMock()
         page.frames = [frame]
+        page.main_frame = frame
         page.url = frame.url
         page.content.return_value = "<html>Appointments</html>"
 
@@ -326,6 +369,13 @@ class ArchiveTests(unittest.TestCase):
                 local_path=str(path.relative_to(root)),
                 digest=digest,
             )
+            other_url = source_url.replace("token=abc", "token=fixture-private-other")
+            store.enqueue(other_url, 0, run_id)
+            store.conn.execute(
+                "UPDATE pages SET last_error=? WHERE url=?",
+                ("Navigation failed at " + other_url, other_url),
+            )
+            store.conn.commit()
             store.finish_run(run_id)
             store.observe(
                 run_id=run_id,
@@ -339,12 +389,27 @@ class ArchiveTests(unittest.TestCase):
                 kind="tab_snapshot",
                 label="Laboratory",
             )
-            store.write_coverage_report(run_id)
+            for suffix in ("one", "two"):
+                legacy = f"https://fixture-credential-{suffix}@example.invalid/read?token={suffix}"
+                store.conn.execute(
+                    "INSERT INTO artifact_sources(sha256,source_url,captured_at) VALUES(?,?,?)",
+                    (digest, legacy, "legacy"),
+                )
+                store.conn.execute(
+                    """INSERT INTO observations(run_id,page_url,kind,label,target_url,observed_at)
+                       VALUES(?,?,?,?,?,?)""",
+                    (run_id, legacy, "legacy", "Fixture", legacy, "legacy"),
+                )
+            store.conn.commit()
+            coverage = store.write_coverage_report(run_id)
+            self.assertNotIn("fixture-private-other", coverage.read_text())
+            self.assertNotIn("fixture-credential-", coverage.read_text())
             self.assertEqual(store.verify_artifacts()["errors"], [])
             db_path = Normalizer(store).build()
             render_markdown(db_path, root / "text" / "complete-medical-record.md")
             write_final_report(store, db_path, run_id)
 
+            (root / "raw" / "unregistered.txt").write_text("unregistered fixture")
             archive = build_complete_archive(store)
             self.assertEqual(archive, base / ARCHIVE_NAME)
             with zipfile.ZipFile(archive) as zf:
@@ -356,14 +421,36 @@ class ArchiveTests(unittest.TestCase):
                 self.assertIn("manifests/final-report.json", names)
                 self.assertTrue(any(name.startswith("raw/html/") for name in names))
                 self.assertFalse(any(name.startswith("logs/") for name in names))
+                self.assertNotIn("raw/unregistered.txt", names)
+                self.assertNotIn(b"fixture-private-other", zf.read("state.sqlite"))
+                self.assertNotIn(b"token=abc", zf.read("state.sqlite"))
+                self.assertNotIn(b"fixture-credential-", zf.read("state.sqlite"))
                 extracted = Path(zf.extract("state.sqlite", base / "extracted"))
 
             archived = sqlite3.connect(extracted)
-            archived_url = archived.execute("SELECT url FROM pages").fetchone()[0]
+            archived_urls = archived.execute("SELECT url FROM pages ORDER BY rowid").fetchall()
+            self.assertEqual(archived.execute("PRAGMA integrity_check").fetchone(), ("ok",))
+            self.assertEqual(archived.execute("SELECT count(*) FROM observations WHERE kind='legacy'").fetchone(),
+                             (2,))
+            self.assertEqual(archived.execute("SELECT count(*) FROM artifact_sources WHERE captured_at='legacy'").fetchone(),
+                             (2,))
             archived.close()
-            self.assertNotIn("token=abc", archived_url)
+            self.assertEqual(len(archived_urls), 2)
+            self.assertNotEqual(archived_urls[0], archived_urls[1])
             live_url = store.conn.execute("SELECT url FROM pages").fetchone()[0]
             self.assertIn("token=abc", live_url)
+            old_zip = archive.read_bytes()
+            old_db = db_path.read_bytes()
+            outside = base / "outside.txt"
+            outside.write_text("unrelated fixture")
+            path.unlink()
+            path.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                build_complete_archive(store)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                Normalizer(store).build()
+            self.assertEqual(archive.read_bytes(), old_zip)
+            self.assertEqual(db_path.read_bytes(), old_db)
             store.close()
 
     def test_final_report_rejects_an_unsnapshotted_read_only_tab(self):

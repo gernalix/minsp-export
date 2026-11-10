@@ -30,11 +30,21 @@ export/
 
 A successful `export` also creates
 `~/Documents/MinSP/minsp-export-complete-2026-09-22.zip`. The archive contains
-only `raw/`, `manifests/`, a sanitized copy of `state.sqlite`,
+only recorded artifacts under `raw/`, the four manifests listed above, a
+sanitized copy of `state.sqlite`,
 `normalized/health.sqlite`, and `text/complete-medical-record.md`. Browser
 profiles, cookies, session storage, credentials, and logs are excluded. The raw
 artifacts remain the authoritative immutable source; the normalized database is
 a technical projection and never replaces the raw capture.
+
+The crawl checks the exact HTTPS portal origin and captures from the main
+document. It blocks routed write methods during the crawl and keeps MitID
+login manual. Automatic tab interaction requires a reviewed route and label
+with a non-submitting control and a visible selected panel. Automatic
+downloads require an explicit link whose HTTPS destination matches the
+download event. Controls with unknown destinations are left for manual
+review. The archive is published only when the crawl has no pending pages
+or exhausted errors.
 
 The normalized database contains a generic record layer plus dedicated tables for lab results, clinical notes, encounters, imaging reports, diagnoses, medications, allergies, appointments, messages, procedures, questionnaires, documents, providers and departments. An FTS5 index makes the captured text searchable.
 

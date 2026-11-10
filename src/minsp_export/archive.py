@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import tempfile
 import time
@@ -11,11 +10,10 @@ import zipfile
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .storage import StateStore, redact_url
+from .storage import StateStore, contained_file, public_error, redact_url, sanitize_observation
 
 
 ARCHIVE_NAME = "minsp-export-complete-2026-09-22.zip"
-URL_RE = re.compile(r"https?://[^\s'\"<>]+")
 
 
 def _utc_now() -> str:
@@ -30,31 +28,60 @@ def _archive_unique_url(url: str, suffix: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
 
 
-def _sanitize_error(value: str | None) -> str | None:
-    if not value:
-        return value
-    return URL_RE.sub(lambda match: redact_url(match.group(0)), value)
-
-
 def _sanitized_state_copy(store: StateStore, destination: Path) -> None:
-    target = sqlite3.connect(destination)
+    target = sqlite3.connect(destination.with_name("state-working.sqlite"))
     try:
         store.conn.backup(target)
         target.row_factory = sqlite3.Row
-        rows = target.execute("SELECT rowid,url,last_error FROM pages ORDER BY rowid").fetchall()
+        rows = target.execute("SELECT rowid,* FROM pages ORDER BY rowid").fetchall()
+        reserved = {redact_url(row["url"]) for row in rows}
         used: set[str] = set()
+        target.execute("DELETE FROM pages")
         for row in rows:
             sanitized = redact_url(row["url"])
             if sanitized in used:
                 suffix = hashlib.sha256(row["url"].encode()).hexdigest()[:16]
-                sanitized = _archive_unique_url(sanitized, suffix)
+                candidate = _archive_unique_url(sanitized, suffix)
+                while candidate in used or candidate in reserved:
+                    suffix += "-"
+                    candidate = _archive_unique_url(sanitized, suffix)
+                sanitized = candidate
             used.add(sanitized)
             target.execute(
-                "UPDATE pages SET url=?,last_error=? WHERE rowid=?",
-                (sanitized, _sanitize_error(row["last_error"]), row["rowid"]),
+                """INSERT INTO pages(rowid,url,status,depth,tries,last_error,title,
+                                     local_path,sha256,updated_at,run_id)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (row["rowid"], sanitized, row["status"], row["depth"], row["tries"],
+                 public_error(row["last_error"]), row["title"], row["local_path"],
+                 row["sha256"], row["updated_at"], row["run_id"]),
+            )
+        sources = [dict(row) for row in target.execute("SELECT * FROM artifact_sources ORDER BY id")]
+        target.execute("DELETE FROM artifact_sources")
+        used_sources = set()
+        for row in sources:
+            url = redact_url(row["source_url"] or "")
+            while (row["sha256"], url, row["captured_at"]) in used_sources:
+                url = _archive_unique_url(url, f"source-{row['id']}")
+            used_sources.add((row["sha256"], url, row["captured_at"]))
+            target.execute("INSERT INTO artifact_sources(id,sha256,source_url,captured_at) VALUES(?,?,?,?)",
+                           (row["id"], row["sha256"], url, row["captured_at"]))
+
+        observations = [sanitize_observation(dict(row)) for row in
+                        target.execute("SELECT * FROM observations ORDER BY id")]
+        target.execute("DELETE FROM observations")
+        used_observations = set()
+        for row in observations:
+            key = (row["run_id"], row["page_url"], row["kind"], row["label"])
+            url = row["target_url"]
+            while (*key, url) in used_observations:
+                url = _archive_unique_url(url, f"observation-{row['id']}")
+            used_observations.add((*key, url))
+            target.execute(
+                "INSERT INTO observations(id,run_id,page_url,kind,label,target_url,observed_at) VALUES(?,?,?,?,?,?,?)",
+                (row["id"], *key, url, row["observed_at"]),
             )
         target.commit()
-        target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        target.execute("VACUUM INTO ?", (str(destination),))
     finally:
         target.close()
 
@@ -93,37 +120,23 @@ def write_final_report(store: StateStore, db_path: Path, run_id: str) -> Path:
             (run_id,),
         )
     }
-    observed_tabs = {
-        row["label"]
-        for row in store.conn.execute(
-            "SELECT DISTINCT label FROM observations WHERE run_id=? AND kind='control:tab' AND label<>''",
-            (run_id,),
-        )
-    }
-    snapshotted_tabs = {
-        row["label"]
-        for row in store.conn.execute(
-            "SELECT DISTINCT label FROM observations WHERE run_id=? AND kind='tab_snapshot' AND label<>''",
-            (run_id,),
-        )
-    }
-    errored_tabs = {
-        row["label"]
-        for row in store.conn.execute(
-            "SELECT DISTINCT label FROM observations WHERE run_id=? AND kind='tab_error' AND label<>''",
-            (run_id,),
-        )
-    }
-    unavailable_tabs = {
-        row["label"]
-        for row in store.conn.execute(
-            "SELECT DISTINCT label FROM observations WHERE run_id=? AND kind='tab_unavailable' AND label<>''",
-            (run_id,),
-        )
-    }
-    missing_tabs = sorted(
-        (observed_tabs | errored_tabs) - snapshotted_tabs - unavailable_tabs
+    tabs_by_kind = {}
+    for kind in ("control:tab", "tab_snapshot", "tab_error", "tab_unavailable"):
+        tabs_by_kind[kind] = {
+            (row["page_url"], row["label"])
+            for row in store.conn.execute(
+                "SELECT page_url,label FROM observations WHERE run_id=? AND kind=? AND label<>''",
+                (run_id, kind),
+            )
+        }
+    missing_pairs = (
+        (tabs_by_kind["control:tab"] | tabs_by_kind["tab_error"])
+        - tabs_by_kind["tab_snapshot"] - tabs_by_kind["tab_unavailable"]
     )
+    observed_tabs = {label for _, label in tabs_by_kind["control:tab"]}
+    snapshotted_tabs = {label for _, label in tabs_by_kind["tab_snapshot"]}
+    unavailable_tabs = {label for _, label in tabs_by_kind["tab_unavailable"]}
+    missing_tabs = sorted({label for _, label in missing_pairs})
     db = sqlite3.connect(db_path)
     try:
         domain_tables = (
@@ -201,14 +214,16 @@ def build_complete_archive(store: StateStore) -> Path:
     root = store.root
     destination = root.parent / ARCHIVE_NAME
     required = (
-        root / "raw",
-        root / "manifests",
-        root / "normalized" / "health.sqlite",
-        root / "text" / "complete-medical-record.md",
+        "manifests/files.jsonl",
+        "manifests/coverage.json",
+        "manifests/inventory.json",
+        "manifests/final-report.json",
+        "normalized/health.sqlite",
+        "text/complete-medical-record.md",
     )
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        raise FileNotFoundError("archive inputs missing: " + ", ".join(missing))
+    inputs = [(rel, contained_file(root, rel, rel.split("/", 1)[0])) for rel in required]
+    artifacts = [(row, contained_file(root, row["local_path"], "raw")) for row in
+                 store.conn.execute("SELECT sha256,local_path,bytes FROM artifacts ORDER BY local_path")]
 
     # Keep the temporary ZIP on the destination filesystem so the final
     # atomic os.replace cannot fail with EXDEV on hosts where /tmp is separate.
@@ -221,16 +236,33 @@ def build_complete_archive(store: StateStore) -> Path:
         _sanitized_state_copy(store, sanitized_state)
         tmp_archive = tmp_root / ARCHIVE_NAME
         with zipfile.ZipFile(tmp_archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
-            for base in (root / "raw", root / "manifests"):
-                for path in sorted(base.rglob("*")):
-                    if path.is_file() and not path.name.endswith(".tmp"):
-                        zf.write(path, path.relative_to(root))
+            for rel, path in inputs:
+                if rel == "manifests/coverage.json":
+                    coverage = json.loads(path.read_text(encoding="utf-8"))
+                    for page in coverage["pages"]:
+                        page["url"] = redact_url(page["url"])
+                        page["last_error"] = public_error(page["last_error"])
+                    coverage["observations"] = [sanitize_observation(item) for item in coverage["observations"]]
+                    zf.writestr(rel, json.dumps(coverage, ensure_ascii=False) + "\n")
+                elif rel == "manifests/files.jsonl":
+                    with path.open(encoding="utf-8") as source, zf.open(rel, "w") as member:
+                        for line in source:
+                            item = json.loads(line)
+                            item["source_url"] = redact_url(item["source_url"] or "")
+                            member.write((json.dumps(item, ensure_ascii=False) + "\n").encode())
+                else:
+                    zf.write(path, rel)
+            for row, path in artifacts:
+                digest = hashlib.sha256()
+                size = 0
+                with path.open("rb") as source, zf.open(row["local_path"], "w", force_zip64=True) as member:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                        size += len(chunk)
+                        member.write(chunk)
+                if size != row["bytes"] or digest.hexdigest() != row["sha256"]:
+                    raise ValueError("archive artifact differs from its registered bytes")
             zf.write(sanitized_state, "state.sqlite")
-            zf.write(root / "normalized" / "health.sqlite", "normalized/health.sqlite")
-            zf.write(
-                root / "text" / "complete-medical-record.md",
-                "text/complete-medical-record.md",
-            )
         with zipfile.ZipFile(tmp_archive) as zf:
             names = set(zf.namelist())
             if not {
@@ -249,6 +281,6 @@ def build_complete_archive(store: StateStore) -> Path:
             bad = zf.testzip()
             if bad is not None:
                 raise RuntimeError(f"archive_corrupt_entry:{bad}")
+        tmp_archive.chmod(0o600)
         os.replace(tmp_archive, destination)
-    destination.chmod(0o600)
     return destination
