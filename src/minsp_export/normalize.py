@@ -6,11 +6,13 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
+from contextlib import closing
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Iterable
 
-from .storage import StateStore, redact_url
+from .storage import StateStore, contained_file, redact_url
 
 DATE_RE = re.compile(r"\b(?:19|20)\d{2}[-/.]\d{1,2}[-/.]\d{1,2}(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?\b")
 
@@ -230,10 +232,18 @@ class Normalizer:
         self.db_path = store.root / "normalized" / "health.sqlite"
 
     def build(self) -> Path:
-        if self.db_path.exists():
-            self.db_path.unlink()
-        conn = sqlite3.connect(self.db_path)
-        conn.execute("PRAGMA journal_mode=WAL")
+        for suffix in ("-wal", "-shm", "-journal"):
+            if self.db_path.with_name(self.db_path.name + suffix).exists():
+                raise RuntimeError("Close normalized database consumers before rebuilding")
+        with tempfile.TemporaryDirectory(prefix=".normalize-", dir=self.db_path.parent) as directory:
+            staged = Path(directory) / self.db_path.name
+            with closing(sqlite3.connect(staged)) as conn:
+                self._populate(conn)
+            staged.chmod(0o600)
+            staged.replace(self.db_path)
+        return self.db_path
+
+    def _populate(self, conn: sqlite3.Connection) -> None:
         conn.executescript(SCHEMA)
         try:
             conn.execute(
@@ -258,9 +268,9 @@ class Normalizer:
             conn.execute(
                 "INSERT INTO source_artifacts VALUES(?,?,?,?,?,?)",
                 (artifact["sha256"], artifact["kind"], artifact["local_path"],
-                 artifact["content_type"], artifact["bytes"], artifact["source_url"]),
+                 artifact["content_type"], artifact["bytes"], redact_url(artifact["source_url"] or "")),
             )
-            path = self.store.root / artifact["local_path"]
+            path = contained_file(self.store.root, artifact["local_path"], "raw")
             if artifact["kind"] == "html":
                 self._normalize_html(conn, artifact, path)
             elif artifact["kind"] == "json":
@@ -270,12 +280,6 @@ class Normalizer:
 
         conn.commit()
         conn.execute("PRAGMA optimize")
-        conn.close()
-        try:
-            self.db_path.chmod(0o600)
-        except OSError:
-            pass
-        return self.db_path
 
     def _insert_record(self, conn, artifact, *, record_id, category, occurred_at, title, body, obj=None) -> None:
         if not body.strip() and not title:

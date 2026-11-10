@@ -27,15 +27,15 @@ def _settings(args) -> Settings:
 
 def _print_crawl_result(result) -> int:
     print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
-    return 2 if result.exhausted_errors else 0
+    return 2 if result.exhausted_errors or result.pending else 0
 
 
 def cmd_login(args) -> int:
     settings = _settings(args)
     secure_dir(settings.profile_dir)
     with BrowserSession(settings, headless=False) as browser:
-        url = browser.ensure_authenticated(interactive=True)
-        print(f"AUTHENTICATED: {url}")
+        browser.ensure_authenticated(interactive=True)
+        print("AUTHENTICATED")
         print(
             "Diagnostic login completed. For a real export use minsp-export export, "
             "which keeps this same browser session alive through the crawl."

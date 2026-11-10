@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
-
-from .config import PORTAL_HOST, PORTAL_PATH_PREFIX, Settings
+from .config import Settings, is_portal_url
 from .storage import secure_dir
 
 
@@ -35,6 +33,7 @@ class BrowserSession:
             channel=self.settings.browser_channel,
             headless=self.headless,
             accept_downloads=True,
+            service_workers="block",
             viewport={"width": 1440, "height": 1000},
         )
         self.context.set_default_navigation_timeout(self.settings.navigation_timeout_ms)
@@ -54,17 +53,7 @@ class BrowserSession:
 
     @staticmethod
     def is_authenticated_portal_url(url: str) -> bool:
-        try:
-            parts = urlsplit(url)
-        except Exception:
-            return False
-        if parts.scheme not in ("http", "https"):
-            return False
-        if (parts.hostname or "").lower() != PORTAL_HOST:
-            return False
-        if not parts.path.lower().startswith(PORTAL_PATH_PREFIX):
-            return False
-        return not BrowserSession.looks_logged_out(url)
+        return is_portal_url(url) and not BrowserSession.looks_logged_out(url)
 
     def ensure_authenticated(self, *, interactive: bool = True) -> str:
         assert self.page is not None

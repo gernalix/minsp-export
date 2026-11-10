@@ -2,10 +2,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 LOGIN_URL = "https://minsundhedsplatform.dk/mychartppr1/Authentication/Login?"
 PORTAL_HOST = "minsundhedsplatform.dk"
 PORTAL_PATH_PREFIX = "/mychartppr1/"
+
+
+def is_portal_url(url: str) -> bool:
+    try:
+        parts = urlsplit(url)
+        return (
+            parts.scheme == "https"
+            and parts.hostname == PORTAL_HOST
+            and parts.port in (None, 443)
+            and parts.username is None
+            and parts.password is None
+            and parts.path.lower().startswith(PORTAL_PATH_PREFIX)
+        )
+    except ValueError:
+        return False
 
 DEFAULT_PROFILE_DIR = Path.home() / ".local" / "share" / "minsp-export" / "chrome-profile"
 DEFAULT_OUTPUT_DIR = Path.home() / "Documents" / "MinSP" / "export"
@@ -34,9 +50,6 @@ SAFE_REVEAL_LABELS = (
     "se mere",
     "show more",
     "load more",
-    "næste",
-    "naeste",
-    "next",
 )
 
 

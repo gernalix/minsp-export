@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 import uuid
@@ -10,6 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 SENSITIVE_QUERY_PARTS = ("token", "auth", "session", "code", "ticket", "key", "secret")
+DIAGNOSTIC_URL_RE = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
 
 
 def utc_now() -> str:
@@ -33,21 +35,65 @@ def redact_url(url: str) -> str:
             if any(part in key.lower() for part in SENSITIVE_QUERY_PARTS):
                 value = "<redacted>"
             redacted.append((key, value))
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted), ""))
-    except Exception:
-        return url
+        return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, urlencode(redacted), ""))
+    except ValueError:
+        return ""
+
+
+def redact_diagnostic(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return DIAGNOSTIC_URL_RE.sub(lambda match: redact_url(match.group()) or "<redacted URL>", value)
+
+
+def public_error(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value in {"TimeoutError", "Error", "ValueError", "OSError", "NavigationError"}:
+        return value
+    return "NavigationError"
+
+
+def sanitize_observation(item: dict) -> dict:
+    return {**item, "page_url": redact_url(item["page_url"]),
+            "target_url": redact_url(item["target_url"]),
+            "label": redact_diagnostic(item["label"])}
 
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def contained_file(root: Path, relative: str, subtree: str) -> Path:
+    path = Path(relative)
+    if path.is_absolute() or len(path.parts) < 2 or path.parts[0] != subtree or ".." in path.parts:
+        raise ValueError("file outside approved export directory")
+    current = root
+    for part in path.parts:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("symbolic link in export input")
+    if not current.is_file():
+        raise ValueError("export input is not a regular file")
+    return current
+
+
 class StateStore:
     def __init__(self, root: Path):
+        if root.is_symlink():
+            raise ValueError("symbolic link in export root")
         self.root = secure_dir(root)
         for rel in ("raw/html", "raw/json", "raw/pdf", "raw/attachments", "manifests", "logs", "normalized", "text"):
+            current = self.root
+            for part in Path(rel).parts:
+                current /= part
+                if current.is_symlink():
+                    raise ValueError("symbolic link in export directory")
             secure_dir(self.root / rel)
         self.db_path = self.root / "state.sqlite"
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            if self.db_path.with_name(self.db_path.name + suffix).is_symlink():
+                raise ValueError("symbolic link in export state")
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -259,7 +305,7 @@ class StateStore:
     def mark_page_error(self, url: str, error: str) -> None:
         self.conn.execute(
             "UPDATE pages SET status='error', tries=tries+1, last_error=?, updated_at=? WHERE url=?",
-            (error[:1000], utc_now(), url),
+            (public_error(error), utc_now(), url),
         )
         self.conn.commit()
 
@@ -366,7 +412,7 @@ class StateStore:
                     "kind": row["kind"],
                     "path": row["local_path"],
                     "sha256": row["sha256"],
-                    "source_url": row["source_url"],
+                    "source_url": redact_url(row["source_url"]),
                 }
                 fh.write(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n")
         os.replace(tmp, path)
@@ -382,9 +428,10 @@ class StateStore:
             "SELECT sha256,local_path,bytes FROM artifacts ORDER BY sha256"
         ).fetchall()
         for row in rows:
-            path = self.root / row["local_path"]
-            if not path.is_file():
-                errors.append(f"missing:{row['local_path']}")
+            try:
+                path = contained_file(self.root, row["local_path"], "raw")
+            except ValueError:
+                errors.append(f"invalid_artifact_path:{row['sha256']}")
                 continue
             data = path.read_bytes()
             if len(data) != row["bytes"]:
@@ -415,11 +462,12 @@ class StateStore:
         for row in page_rows:
             item = dict(row)
             item["url"] = redact_url(item["url"])
+            item["last_error"] = public_error(item["last_error"])
             pages.append(item)
         payload = {
             "run_id": run_id,
             "pages": pages,
-            "observations": [dict(row) for row in observation_rows],
+            "observations": [sanitize_observation(dict(row)) for row in observation_rows],
         }
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
