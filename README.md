@@ -64,13 +64,15 @@ The normalized database contains a generic record layer plus dedicated tables fo
 - Python package `playwright`
 - optional: `pdftotext` (Poppler) for searchable PDF text
 
-Install the package using the system/user Python policy you already use on Fedora; this repository does not require or create a virtual environment.
+On Fedora, install Playwright and its dependencies in the project package
+directory using the system Python. The installer creates the user launcher
+without accessing MyChart, Chrome profiles or existing exports.
 
 ## Usage
 
 ```bash
 # From the repository root
-python3 -m pip install --user -e .
+bash tools/install-runtime
 # Normal workflow: opens Chrome, lets you complete MitID if needed, then
 # keeps that SAME browser session alive through the complete crawl.
 minsp-export export

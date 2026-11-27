@@ -1,0 +1,73 @@
+#!/usr/bin/bash
+set -euo pipefail
+umask 077
+
+repo=$(cd -- "$(dirname -- "$0")/.." && pwd -P)
+runtime="${XDG_DATA_HOME:-$HOME/.local/share}/minsp-export"
+bin="${XDG_BIN_HOME:-$HOME/.local/bin}"
+packages="$runtime/packages"
+launcher="$bin/minsp-export"
+lock="$runtime/.dependency-update.lock"
+
+install -d -m 700 "$runtime"
+mkdir -p "$bin"
+if [[ -L $runtime || -L $packages || -L $launcher || -L $lock ||
+      ( -e $packages && ! -d $packages ) || ( -e $launcher && ! -f $launcher ) ]]; then
+    echo 'Il percorso del runtime deve contenere file e directory locali.' >&2
+    exit 1
+fi
+exec 9<>"$lock"
+flock -n 9
+stage=$(mktemp -d "$runtime/.install.XXXXXXXX")
+temp_launcher=$(mktemp "$bin/.minsp-export.XXXXXXXX")
+trap 'rm -rf -- "$stage"; rm -f -- "$temp_launcher"' EXIT
+
+/usr/bin/python3 -I -B - "$repo/pyproject.toml" "$stage/requirements.txt" <<'PY'
+import sys
+import tomllib
+from pathlib import Path
+
+manifest = tomllib.loads(Path(sys.argv[1]).read_text())
+Path(sys.argv[2]).write_text("\n".join(manifest["project"]["dependencies"]) + "\n")
+PY
+/usr/bin/env -i PATH=/usr/bin:/bin HOME="$stage" /usr/bin/uv --no-config --no-cache pip install \
+    --python /usr/bin/python3 --index-url https://pypi.org/simple \
+    --only-binary :all: --target "$stage/packages" -r "$stage/requirements.txt"
+PYTHONPATH="$repo/src:$stage/packages" /usr/bin/python3 -S -P -B -c '
+import sys
+import minsp_export.cli, playwright.sync_api
+assert sys.prefix == sys.base_prefix
+'
+PYTHONPATH="$repo/src:$stage/packages" /usr/bin/python3 -S -P -B -m minsp_export.cli --help >/dev/null
+
+{
+    echo '#!/usr/bin/bash'
+    echo 'set -euo pipefail'
+    echo 'unset PYTHONHOME VIRTUAL_ENV'
+    printf 'export PYTHONPATH=%q\n' "$repo/src:$packages"
+    printf 'exec 9<%q\n' "$lock"
+    echo '/usr/bin/flock -s 9'
+    echo 'exec /usr/bin/python3 -S -P -B -m minsp_export.cli "$@"'
+} > "$temp_launcher"
+chmod 700 "$temp_launcher"
+
+if [[ -f $launcher ]]; then
+    backup=$(mktemp "$runtime/.previous-launcher.XXXXXXXX")
+    cp -p -- "$launcher" "$backup"
+fi
+if [[ -d $packages ]]; then
+    previous=$(mktemp -d "$runtime/.previous.XXXXXXXX")
+    /usr/bin/mv -T -- "$stage/packages" "$previous/packages"
+    /usr/bin/mv -T --exchange --no-copy "$previous/packages" "$packages"
+else
+    previous=
+    /usr/bin/mv -T -- "$stage/packages" "$packages"
+fi
+if ! /usr/bin/mv -T -- "$temp_launcher" "$launcher"; then
+    if [[ -n $previous ]]; then
+        /usr/bin/mv -T --exchange --no-copy "$previous/packages" "$packages"
+    else
+        /usr/bin/mv -T -- "$packages" "$stage/packages"
+    fi
+    exit 1
+fi

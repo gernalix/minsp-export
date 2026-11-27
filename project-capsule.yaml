@@ -52,8 +52,8 @@ runtime:
 devices: []
 commands:
   setup:
-    not_applicable: Python package and browser dependencies are installed in the user's
-      managed environment; this repository has no setup or virtual-environment script.
+    not_applicable: The package directory and launcher are installed separately
+      with tools/install-runtime. Capsule checks use only offline fixtures.
   build:
     not_applicable: Python package is installed directly; there is no compiled build
       artifact.
@@ -96,9 +96,6 @@ commands:
     - --ro-bind
     - .
     - /tmp/work
-    - --ro-bind
-    - /home/daniele/.local/lib/python3.14/site-packages
-    - /home/daniele/.local/lib/python3.14/site-packages
     - --chdir
     - /tmp/work
     - --clearenv
@@ -110,7 +107,7 @@ commands:
     - /tmp
     - --setenv
     - PYTHONPATH
-    - /tmp/work:/tmp/work/src:/home/daniele/.local/lib/python3.14/site-packages
+    - /tmp/work:/tmp/work/src
     - --setenv
     - PYTHONDONTWRITEBYTECODE
     - '1'
